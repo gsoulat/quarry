@@ -151,34 +151,7 @@ pub async fn save_with_dialog(suggested: String, format: Format, bytes: Vec<u8>)
 mod tests {
     use super::*;
 
-    /// Connecteur factice : seules les méthodes de génération SQL servent ici.
-    #[derive(Debug)]
-    struct Fake;
-
-    #[async_trait::async_trait]
-    impl Connector for Fake {
-        fn engine(&self) -> &'static str {
-            "fake"
-        }
-        async fn list_tables(&self) -> crate::connector::Result<Vec<TableRef>> {
-            Ok(Vec::new())
-        }
-        async fn describe_table(&self, _: &TableRef) -> crate::connector::Result<Vec<crate::connector::ColumnInfo>> {
-            Ok(Vec::new())
-        }
-        async fn list_relations(&self) -> crate::connector::Result<Vec<crate::connector::Relation>> {
-            Ok(Vec::new())
-        }
-        async fn explain(&self, _: &str) -> crate::connector::Result<crate::connector::QueryPlan> {
-            Ok(Default::default())
-        }
-        async fn query(&self, _: &str) -> crate::connector::Result<crate::connector::QueryResult> {
-            Ok(Default::default())
-        }
-        async fn execute(&self, _: &str) -> crate::connector::Result<u64> {
-            Ok(0)
-        }
-    }
+    use crate::connector::test_support::Fake;
 
     fn sample() -> (Vec<String>, Vec<Vec<Cell>>) {
         (
@@ -194,7 +167,7 @@ mod tests {
     fn csv_quotes_and_leaves_null_empty() {
         let (columns, rows) = sample();
         let refs: Vec<&Vec<Cell>> = rows.iter().collect();
-        let out = String::from_utf8(render(Format::Csv, &columns, &refs, None, &Fake).unwrap()).unwrap();
+        let out = String::from_utf8(render(Format::Csv, &columns, &refs, None, &Fake::standard()).unwrap()).unwrap();
         assert_eq!(out, "id,name,score\n1,\"Ada, \"\"la\"\" première\",9.5\n2,Linus,\n");
     }
 
@@ -202,7 +175,7 @@ mod tests {
     fn json_keeps_types() {
         let (columns, rows) = sample();
         let refs: Vec<&Vec<Cell>> = rows.iter().collect();
-        let out = render(Format::Json, &columns, &refs, None, &Fake).unwrap();
+        let out = render(Format::Json, &columns, &refs, None, &Fake::standard()).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(value[0]["id"], 1);
         assert_eq!(value[0]["score"], 9.5);
@@ -214,7 +187,7 @@ mod tests {
         let (columns, rows) = sample();
         let refs: Vec<&Vec<Cell>> = rows.iter().collect();
         let table = TableRef { schema: None, name: "users".into() };
-        let out = String::from_utf8(render(Format::Sql, &columns, &refs, Some(&table), &Fake).unwrap()).unwrap();
+        let out = String::from_utf8(render(Format::Sql, &columns, &refs, Some(&table), &Fake::standard()).unwrap()).unwrap();
         assert_eq!(out.lines().count(), 2);
         assert!(out.starts_with("INSERT INTO \"users\" (\"id\", \"name\", \"score\") VALUES ('1', 'Ada, \"la\" première', '9.5');"));
         assert!(out.contains("('2', 'Linus', NULL)"));
@@ -224,7 +197,7 @@ mod tests {
     fn xlsx_is_a_zip() {
         let (columns, rows) = sample();
         let refs: Vec<&Vec<Cell>> = rows.iter().collect();
-        let out = render(Format::Xlsx, &columns, &refs, None, &Fake).unwrap();
+        let out = render(Format::Xlsx, &columns, &refs, None, &Fake::standard()).unwrap();
         assert_eq!(&out[..2], b"PK");
     }
 }

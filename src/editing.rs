@@ -11,33 +11,26 @@ use iced::{Background, Color, Element, Fill, Font};
 use iced::widget::pick_list;
 
 use crate::app::Message;
-use crate::connector::{Alter, Cell, ColumnDef, ColumnInfo, Connector, Input, TableRef};
-use crate::store::Engine;
+use crate::connector::{Alter, Cell, ColumnDef, ColumnInfo, Connector, Dialect, Input, TableRef};
 use crate::theme;
 
 const MONO: Font = Font::MONOSPACE;
 /// Entrée du menu des types qui rend la saisie libre.
 const CUSTOM_TYPE: &str = "Personnalisé…";
 
-/// Types proposés dans le menu déroulant, par moteur. Les plus courants
-/// d'abord ; « Personnalisé… » couvre le reste (VARCHAR(100), NUMERIC(10,2)…).
-pub fn type_options(engine: Engine) -> &'static [&'static str] {
-    match engine {
-        Engine::Postgres => &[
-            "INTEGER", "BIGINT", "SMALLINT", "SERIAL", "BIGSERIAL", "NUMERIC", "REAL",
-            "DOUBLE PRECISION", "BOOLEAN", "TEXT", "VARCHAR(255)", "UUID", "DATE", "TIME",
-            "TIMESTAMP", "TIMESTAMPTZ", "JSON", "JSONB", "BYTEA",
-        ],
-        Engine::MySql => &[
-            "INT", "BIGINT", "SMALLINT", "TINYINT", "DECIMAL(10,2)", "FLOAT", "DOUBLE", "BOOLEAN",
-            "VARCHAR(255)", "TEXT", "CHAR(36)", "DATE", "TIME", "DATETIME", "TIMESTAMP", "JSON",
-            "BLOB",
-        ],
-        Engine::Sqlite => &["INTEGER", "REAL", "TEXT", "BLOB", "NUMERIC"],
-        Engine::BigQuery => &[
-            "INT64", "FLOAT64", "NUMERIC", "BOOL", "STRING", "BYTES", "DATE", "TIME", "DATETIME",
-            "TIMESTAMP", "JSON",
-        ],
+/// Dialecte par défaut (SQL standard) quand aucune connexion n'est ouverte.
+pub fn default_dialect() -> Dialect {
+    Dialect {
+        identifier_quote: '"',
+        backslash_escapes: false,
+        has_schemas: true,
+        rename_table_statement: false,
+        schema_is_database: false,
+        types: ["INTEGER", "BIGINT", "NUMERIC", "REAL", "BOOLEAN", "TEXT", "VARCHAR(255)", "DATE", "TIMESTAMP"]
+            .map(String::from)
+            .to_vec(),
+        id_type: "INTEGER".into(),
+        import_types: ["BIGINT".into(), "DOUBLE PRECISION".into(), "BOOLEAN".into(), "TEXT".into()],
     }
 }
 
@@ -215,7 +208,7 @@ pub struct TableForm {
 }
 
 impl TableForm {
-    pub fn new(schemas: Vec<String>, engine: Engine) -> Self {
+    pub fn new(schemas: Vec<String>, id_type: &str) -> Self {
         // `public` d'abord si présent, sinon le premier schéma.
         let schema = schemas
             .iter()
@@ -223,12 +216,6 @@ impl TableForm {
             .or(schemas.first())
             .cloned()
             .unwrap_or_default();
-        let id_type = match engine {
-            Engine::Postgres => "SERIAL",
-            Engine::MySql => "INT",
-            Engine::Sqlite => "INTEGER",
-            Engine::BigQuery => "INT64",
-        };
         let id = ColumnDraft { name: "id".into(), data_type: id_type.into(), ..ColumnDraft::new() };
         let id = ColumnDraft { nullable: false, primary_key: true, ..id };
         Self { schemas, schema, name: String::new(), columns: vec![id, ColumnDraft::new()] }
@@ -435,7 +422,7 @@ fn set_column(columns: &mut [ColumnDraft], i: usize, f: impl FnOnce(&mut ColumnD
 // Vues
 // ----------------------------------------------------------------------
 
-pub fn view<'a>(dialog: &'a Dialog, error: Option<&'a str>, engine: Engine) -> Element<'a, Message> {
+pub fn view<'a>(dialog: &'a Dialog, error: Option<&'a str>, dialect: &'a Dialect) -> Element<'a, Message> {
     let (title, body, submit_label): (String, Element<'a, Message>, &str) = match dialog {
         Dialog::Row(f) => (
             match &f.original {
@@ -445,8 +432,8 @@ pub fn view<'a>(dialog: &'a Dialog, error: Option<&'a str>, engine: Engine) -> E
             row_form(f),
             "Voir le SQL",
         ),
-        Dialog::Table(f) => ("Nouvelle table".into(), table_form(f, engine), "Voir le SQL"),
-        Dialog::Column(f) => (format!("Ajouter une colonne à {}", f.table), column_form(f, engine), "Voir le SQL"),
+        Dialog::Table(f) => ("Nouvelle table".into(), table_form(f, dialect), "Voir le SQL"),
+        Dialog::Column(f) => (format!("Ajouter une colonne à {}", f.table), column_form(f, dialect), "Voir le SQL"),
         Dialog::Rename(f) => (
             match &f.column {
                 Some(c) => format!("Renommer la colonne {c}"),
@@ -542,7 +529,7 @@ fn row_form(f: &RowForm) -> Element<'_, Message> {
 }
 
 /// Menu des types, ou champ libre si la colonne est en mode personnalisé.
-fn type_picker<'a>(i: usize, c: &'a ColumnDraft, engine: Engine) -> Element<'a, Message> {
+fn type_picker<'a>(i: usize, c: &'a ColumnDraft, dialect: &'a Dialect) -> Element<'a, Message> {
     if c.custom_type {
         return row![
             text_input("VARCHAR(100), NUMERIC(10,2)…", &c.data_type)
@@ -561,7 +548,7 @@ fn type_picker<'a>(i: usize, c: &'a ColumnDraft, engine: Engine) -> Element<'a, 
         .into();
     }
 
-    let mut options: Vec<String> = type_options(engine).iter().map(|t| t.to_string()).collect();
+    let mut options: Vec<String> = dialect.types.clone();
     // Un type venu d'ailleurs (table existante, saisie libre) reste sélectionnable.
     if !c.data_type.is_empty() && !options.contains(&c.data_type) {
         options.insert(0, c.data_type.clone());
@@ -584,7 +571,7 @@ fn type_picker<'a>(i: usize, c: &'a ColumnDraft, engine: Engine) -> Element<'a, 
     .into()
 }
 
-fn column_rows<'a>(columns: &'a [ColumnDraft], removable: bool, engine: Engine) -> Element<'a, Message> {
+fn column_rows<'a>(columns: &'a [ColumnDraft], removable: bool, dialect: &'a Dialect) -> Element<'a, Message> {
     let header = row![
         container(label("Nom")).width(Fill),
         container(label("Type")).width(Fill),
@@ -601,7 +588,7 @@ fn column_rows<'a>(columns: &'a [ColumnDraft], removable: bool, engine: Engine) 
                 .size(13)
                 .padding(6)
                 .width(Fill),
-            container(type_picker(i, c, engine)).width(Fill),
+            container(type_picker(i, c, dialect)).width(Fill),
             container(
                 checkbox(c.nullable && !c.primary_key)
                     .on_toggle(move |v| Message::Dialog(DialogMessage::ColumnNullable(i, v)))
@@ -628,7 +615,7 @@ fn column_rows<'a>(columns: &'a [ColumnDraft], removable: bool, engine: Engine) 
     column![header, Column::with_children(rows).spacing(6)].spacing(6).into()
 }
 
-fn table_form(f: &TableForm, engine: Engine) -> Element<'_, Message> {
+fn table_form<'a>(f: &'a TableForm, dialect: &'a Dialect) -> Element<'a, Message> {
     let schema_field: Element<'_, Message> = if f.schemas.is_empty() {
         column![].into()
     } else {
@@ -660,7 +647,7 @@ fn table_form(f: &TableForm, engine: Engine) -> Element<'_, Message> {
         ]
         .spacing(12),
         label("Colonnes — choisis le type dans le menu, ou « Personnalisé… » pour le saisir."),
-        column_rows(&f.columns, true, engine),
+        column_rows(&f.columns, true, dialect),
         button(text("+ Colonne").size(13))
             .on_press(Message::Dialog(DialogMessage::AddColumnRow))
             .style(button::secondary)
@@ -670,10 +657,10 @@ fn table_form(f: &TableForm, engine: Engine) -> Element<'_, Message> {
     .into()
 }
 
-fn column_form(f: &ColumnForm, engine: Engine) -> Element<'_, Message> {
+fn column_form<'a>(f: &'a ColumnForm, dialect: &'a Dialect) -> Element<'a, Message> {
     column![
         label("Une nouvelle colonne doit accepter NULL ou avoir une valeur par défaut si la table contient déjà des lignes."),
-        column_rows(std::slice::from_ref(&f.draft), false, engine),
+        column_rows(std::slice::from_ref(&f.draft), false, dialect),
     ]
     .spacing(12)
     .into()

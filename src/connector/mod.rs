@@ -1,98 +1,33 @@
-//! Couche d'accès aux bases : un trait commun que chaque moteur implémente.
+//! Couche d'accès aux bases.
 //!
-//! L'interface ne connaît que [`Connector`] ; ajouter un moteur (MongoDB…)
-//! revient à écrire un nouveau module qui implémente ce trait.
+//! Les types de données (tables, colonnes, cellules, plans…) viennent de
+//! la crate `quarry-protocol`, partagée avec les connecteurs. Deux
+//! implémentations du trait [`Connector`] :
+//! - [`sqlite::Sqlite`], intégrée à l'application (aucun téléchargement) ;
+//! - [`process::ProcessConnector`], qui pilote un connecteur téléchargé
+//!   (PostgreSQL, MySQL, BigQuery…) lancé comme processus enfant.
+//!
+//! La génération du SQL d'édition (INSERT, CREATE TABLE…) est faite ici,
+//! à partir du [`Dialect`] annoncé par le connecteur.
 
-#[cfg(feature = "bigquery")]
-mod bigquery;
-mod plan;
-mod sql;
+pub mod plan;
+pub mod process;
+pub mod sqlite;
 
 use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
-pub use plan::{QueryPlan, execution_order};
+pub use plan::execution_order;
+pub use quarry_protocol::{Cell, ColumnInfo, Dialect, PlanNode, QueryPlan, QueryResult, Relation, TableRef};
 
 use crate::store::{ConnectionConfig, Engine};
 
-/// Au-delà, on arrête de lire : la grille reste fluide et la mémoire basse.
-pub const MAX_ROWS: usize = 5_000;
-
 pub type Result<T> = std::result::Result<T, String>;
 
-/// Une table (ou vue), éventuellement qualifiée par son schéma.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TableRef {
-    pub schema: Option<String>,
-    pub name: String,
-}
-
-impl fmt::Display for TableRef {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.schema {
-            Some(schema) => write!(f, "{schema}.{}", self.name),
-            None => f.write_str(&self.name),
-        }
-    }
-}
-
-/// Description d'une colonne, pour la vue « Schéma ».
-#[derive(Debug, Clone)]
-pub struct ColumnInfo {
-    pub name: String,
-    pub data_type: String,
-    pub nullable: bool,
-    pub default: Option<String>,
-    pub primary_key: bool,
-}
-
-/// Valeur d'une cellule, indépendante du moteur.
-#[derive(Debug, Clone)]
-pub enum Cell {
-    Null,
-    Bool(bool),
-    Int(i64),
-    Float(f64),
-    Text(String),
-    /// Type que l'on ne sait pas encore décoder : on garde son nom.
-    Unsupported(String),
-}
-
-impl Cell {
-    /// Texte affiché dans la grille de résultats.
-    pub fn display(&self) -> String {
-        const MAX_CHARS: usize = 200;
-        match self {
-            Cell::Null => "NULL".into(),
-            Cell::Bool(b) => b.to_string(),
-            Cell::Int(i) => i.to_string(),
-            Cell::Float(f) => f.to_string(),
-            Cell::Text(s) if s.chars().count() > MAX_CHARS => {
-                let truncated: String = s.chars().take(MAX_CHARS).collect();
-                format!("{truncated}…")
-            }
-            Cell::Text(s) => s.clone(),
-            Cell::Unsupported(type_name) => format!("<{type_name}>"),
-        }
-    }
-}
-
-/// Une clé étrangère : `from.from_columns` référence `to.to_columns`.
-#[derive(Debug, Clone)]
-pub struct Relation {
-    pub from: TableRef,
-    pub from_columns: Vec<String>,
-    pub to: TableRef,
-    pub to_columns: Vec<String>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct QueryResult {
-    pub columns: Vec<String>,
-    pub rows: Vec<Vec<Cell>>,
-}
+/// Au-delà, on arrête de lire : la grille reste fluide et la mémoire basse.
+pub const MAX_ROWS: usize = 5_000;
 
 /// Valeur saisie dans un formulaire de ligne.
 #[derive(Debug, Clone, PartialEq)]
@@ -123,11 +58,30 @@ pub enum Alter {
 #[async_trait]
 pub trait Connector: Send + Sync + fmt::Debug {
     /// Nom lisible du moteur (« PostgreSQL », « SQLite »…).
-    fn engine(&self) -> &'static str;
+    fn engine(&self) -> &str;
 
-    /// Protège un identifiant (nom de table, de colonne) pour ce moteur.
+    /// Règles du dialecte, pour générer le SQL d'édition.
+    fn dialect(&self) -> &Dialect;
+
+    async fn list_schemas(&self) -> Result<Vec<String>>;
+    async fn list_tables(&self) -> Result<Vec<TableRef>>;
+    async fn describe_table(&self, table: &TableRef) -> Result<Vec<ColumnInfo>>;
+    /// Toutes les clés étrangères de la base, pour le diagramme.
+    async fn list_relations(&self) -> Result<Vec<Relation>>;
+    /// Plan d'exécution estimé, **sans** exécuter la requête.
+    async fn explain(&self, sql: &str) -> Result<QueryPlan>;
+    async fn query(&self, sql: &str) -> Result<QueryResult>;
+    /// Exécute une instruction sans résultat et renvoie les lignes touchées.
+    async fn execute(&self, sql: &str) -> Result<u64>;
+
+    // ------------------------------------------------------------------
+    // Génération de SQL, d'après le dialecte
+    // ------------------------------------------------------------------
+
     fn quote_identifier(&self, ident: &str) -> String {
-        format!("\"{}\"", ident.replace('"', "\"\""))
+        let q = self.dialect().identifier_quote;
+        let doubled = format!("{q}{q}");
+        format!("{q}{}{q}", ident.replace(q, &doubled))
     }
 
     /// Nom de table qualifié et protégé.
@@ -140,9 +94,11 @@ pub trait Connector: Send + Sync + fmt::Debug {
         }
     }
 
-    /// Littéral texte : les apostrophes sont doublées (SQL standard).
+    /// Littéral texte : apostrophes doublées, antislash doublé si le moteur
+    /// l'interprète.
     fn quote_literal(&self, value: &str) -> String {
-        format!("'{}'", value.replace('\'', "''"))
+        let escaped = if self.dialect().backslash_escapes { value.replace('\\', "\\\\") } else { value.to_string() };
+        format!("'{}'", escaped.replace('\'', "''"))
     }
 
     /// Littéral d'une valeur lue dans la grille (pour cibler une ligne).
@@ -207,12 +163,7 @@ pub trait Connector: Send + Sync + fmt::Debug {
             .iter()
             .map(|row| format!("({})", row.iter().map(|v| self.input_literal(v)).collect::<Vec<_>>().join(", ")))
             .collect();
-        format!(
-            "INSERT INTO {} ({})\nVALUES\n{}",
-            self.quote_table(table),
-            columns.join(", "),
-            values.join(",\n")
-        )
+        format!("INSERT INTO {} ({})\nVALUES\n{}", self.quote_table(table), columns.join(", "), values.join(",\n"))
     }
 
     fn update_sql(&self, table: &TableRef, set: &[(String, Input)], key: &[(String, Cell)]) -> String {
@@ -251,12 +202,22 @@ pub trait Connector: Send + Sync + fmt::Debug {
 
     /// `None` si le moteur n'a pas de schémas (SQLite).
     fn create_schema_sql(&self, name: &str) -> Option<String> {
-        Some(format!("CREATE SCHEMA {}", self.quote_identifier(name)))
+        let d = self.dialect();
+        if !d.has_schemas && !d.schema_is_database {
+            return None;
+        }
+        let keyword = if d.schema_is_database { "DATABASE" } else { "SCHEMA" };
+        Some(format!("CREATE {keyword} {}", self.quote_identifier(name)))
     }
 
-    /// Refuse de supprimer un schéma non vide (pas de CASCADE) : c'est volontaire.
+    /// Refuse de supprimer un schéma non vide (pas de CASCADE) : c'est voulu.
     fn drop_schema_sql(&self, name: &str) -> Option<String> {
-        Some(format!("DROP SCHEMA {}", self.quote_identifier(name)))
+        let d = self.dialect();
+        if !d.has_schemas && !d.schema_is_database {
+            return None;
+        }
+        let keyword = if d.schema_is_database { "DATABASE" } else { "SCHEMA" };
+        Some(format!("DROP {keyword} {}", self.quote_identifier(name)))
     }
 
     fn drop_table_sql(&self, table: &TableRef) -> String {
@@ -264,53 +225,131 @@ pub trait Connector: Send + Sync + fmt::Debug {
     }
 
     fn alter_table_sql(&self, table: &TableRef, alter: &Alter) -> String {
-        let table = self.quote_table(table);
+        let quoted = self.quote_table(table);
         match alter {
-            Alter::AddColumn(column) => format!("ALTER TABLE {table}\nADD COLUMN {}", self.column_ddl(column)),
-            Alter::DropColumn(name) => format!("ALTER TABLE {table}\nDROP COLUMN {}", self.quote_identifier(name)),
+            Alter::AddColumn(column) => format!("ALTER TABLE {quoted}\nADD COLUMN {}", self.column_ddl(column)),
+            Alter::DropColumn(name) => format!("ALTER TABLE {quoted}\nDROP COLUMN {}", self.quote_identifier(name)),
             Alter::RenameColumn { from, to } => format!(
-                "ALTER TABLE {table}\nRENAME COLUMN {} TO {}",
+                "ALTER TABLE {quoted}\nRENAME COLUMN {} TO {}",
                 self.quote_identifier(from),
                 self.quote_identifier(to)
             ),
-            Alter::RenameTable(to) => format!("ALTER TABLE {table}\nRENAME TO {}", self.quote_identifier(to)),
+            Alter::RenameTable(to) if self.dialect().rename_table_statement => {
+                format!("RENAME TABLE {quoted} TO {}", self.quote_identifier(to))
+            }
+            Alter::RenameTable(to) => format!("ALTER TABLE {quoted}\nRENAME TO {}", self.quote_identifier(to)),
         }
     }
-
-    async fn list_tables(&self) -> Result<Vec<TableRef>>;
-
-    /// Schémas (ou datasets) existants, même vides. Vide si le moteur n'en a pas.
-    async fn list_schemas(&self) -> Result<Vec<String>> {
-        Ok(Vec::new())
-    }
-
-    async fn describe_table(&self, table: &TableRef) -> Result<Vec<ColumnInfo>>;
-
-    /// Toutes les clés étrangères de la base, pour le diagramme.
-    async fn list_relations(&self) -> Result<Vec<Relation>>;
-
-    /// Plan d'exécution estimé, **sans** exécuter la requête.
-    async fn explain(&self, sql: &str) -> Result<QueryPlan>;
-
-    async fn query(&self, sql: &str) -> Result<QueryResult>;
-
-    /// Exécute une instruction sans résultat (INSERT, UPDATE, DDL…) et
-    /// renvoie le nombre de lignes touchées quand le moteur le connaît.
-    async fn execute(&self, sql: &str) -> Result<u64>;
 }
 
 /// Ouvre une connexion enregistrée, avec son mot de passe éventuel.
-pub async fn connect(
-    config: &ConnectionConfig,
-    password: Option<String>,
-) -> Result<Arc<dyn Connector>> {
+pub async fn connect(config: &ConnectionConfig, password: Option<String>) -> Result<Arc<dyn Connector>> {
     match config.engine {
-        Engine::Postgres | Engine::MySql | Engine::Sqlite => {
-            Ok(Arc::new(sql::SqlConnector::connect(config, password.as_deref()).await?))
+        Engine::Sqlite => Ok(Arc::new(sqlite::Sqlite::connect(&config.path).await?)),
+        engine => {
+            let id = engine.plugin_id().ok_or("Moteur sans connecteur")?;
+            let binary = crate::plugins::installed_binary(id).ok_or_else(|| {
+                format!("Le connecteur {engine} n'est pas installé : ouvre « Gérer » puis « Connecteurs » pour le télécharger.")
+            })?;
+            let params = quarry_protocol::ConnectParams {
+                host: config.host.clone(),
+                port: config.port.or(engine.default_port()),
+                user: config.user.clone(),
+                password,
+                database: config.database.clone(),
+                path: config.path.clone(),
+                project_id: config.project_id.clone(),
+                credentials_path: config.credentials_path.clone(),
+                max_rows: MAX_ROWS,
+            };
+            Ok(Arc::new(process::ProcessConnector::launch(&binary, params).await?))
         }
-        #[cfg(feature = "bigquery")]
-        Engine::BigQuery => Ok(Arc::new(bigquery::BigQueryConnector::connect(config).await?)),
-        #[cfg(not(feature = "bigquery"))]
-        Engine::BigQuery => Err("Quarry a été compilé sans la fonctionnalité « bigquery »".into()),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// Connecteur factice : seules les méthodes de génération SQL servent.
+    #[derive(Debug)]
+    pub struct Fake(pub Dialect);
+
+    impl Fake {
+        pub fn standard() -> Self {
+            Self(Dialect {
+                identifier_quote: '"',
+                backslash_escapes: false,
+                has_schemas: true,
+                rename_table_statement: false,
+                schema_is_database: false,
+                types: vec!["INTEGER".into(), "TEXT".into()],
+                id_type: "INTEGER".into(),
+                import_types: ["BIGINT".into(), "DOUBLE PRECISION".into(), "BOOLEAN".into(), "TEXT".into()],
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Connector for Fake {
+        fn engine(&self) -> &str {
+            "fake"
+        }
+        fn dialect(&self) -> &Dialect {
+            &self.0
+        }
+        async fn list_schemas(&self) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn list_tables(&self) -> Result<Vec<TableRef>> {
+            Ok(Vec::new())
+        }
+        async fn describe_table(&self, _: &TableRef) -> Result<Vec<ColumnInfo>> {
+            Ok(Vec::new())
+        }
+        async fn list_relations(&self) -> Result<Vec<Relation>> {
+            Ok(Vec::new())
+        }
+        async fn explain(&self, _: &str) -> Result<QueryPlan> {
+            Ok(Default::default())
+        }
+        async fn query(&self, _: &str) -> Result<QueryResult> {
+            Ok(Default::default())
+        }
+        async fn execute(&self, _: &str) -> Result<u64> {
+            Ok(0)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::Fake;
+    use super::*;
+
+    #[test]
+    fn mysql_dialect_changes_quoting_and_rename() {
+        let mut fake = Fake::standard();
+        fake.0.identifier_quote = '`';
+        fake.0.backslash_escapes = true;
+        fake.0.rename_table_statement = true;
+        fake.0.schema_is_database = true;
+        fake.0.has_schemas = false;
+        let t = TableRef { schema: None, name: "users".into() };
+        assert_eq!(fake.quote_identifier("a`b"), "`a``b`");
+        assert_eq!(fake.quote_literal("C:\\x'y"), "'C:\\\\x''y'");
+        assert_eq!(fake.alter_table_sql(&t, &Alter::RenameTable("people".into())), "RENAME TABLE `users` TO `people`");
+        assert_eq!(fake.create_schema_sql("app").unwrap(), "CREATE DATABASE `app`");
+    }
+
+    #[test]
+    fn standard_dialect_generates_ansi_sql() {
+        let fake = Fake::standard();
+        let t = TableRef { schema: Some("public".into()), name: "users".into() };
+        assert_eq!(
+            fake.update_sql(&t, &[("name".into(), Input::Text("O'Brien".into()))], &[("id".into(), Cell::Int(3))]),
+            "UPDATE \"public\".\"users\"\nSET \"name\" = 'O''Brien'\nWHERE \"id\" = 3"
+        );
+        assert_eq!(fake.create_schema_sql("ventes").unwrap(), "CREATE SCHEMA \"ventes\"");
     }
 }

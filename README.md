@@ -4,7 +4,8 @@ Client de bases de données léger et multiplateforme (macOS, Linux, Windows), �
 
 ## Fonctionnalités
 
-- **PostgreSQL**, **MySQL**, **SQLite** et **Google BigQuery**
+- **SQLite intégré** ; **PostgreSQL**, **MySQL** et **Google BigQuery** sous forme de **connecteurs téléchargeables** (Gérer → Connecteurs) depuis [quarry-connectors](https://github.com/gsoulat/quarry-connectors), vérifiés par SHA-256 — on n'installe que ceux dont on a besoin
+- Vérification de **mise à jour** de Quarry au démarrage (bouton dans la barre du haut)
 - **Gestionnaire de connexions** (bouton « Gérer ») : ajouter, tester, modifier, supprimer, ranger dans des **dossiers**
 - **Menu « Édition »** : créer / renommer / supprimer une table, ajouter / renommer / supprimer une colonne (types dans un menu déroulant par moteur), insérer / modifier / supprimer une ligne (onglet Données). Le SQL généré est **affiché et confirmé avant exécution**
 - Barre latérale groupée en **Local / Distant / Cloud** : un clic pour se (re)connecter
@@ -34,11 +35,7 @@ Chaque moteur a sa propre échelle de coût : les valeurs ne sont pas comparable
 
 Les exécutables pour macOS (Apple Silicon et Intel), Linux et Windows sont sur la page [Releases](https://github.com/gsoulat/quarry/releases). Ils sont construits par GitHub Actions à chaque tag `v*` ; voir `.github/workflows/release.yml`.
 
-Pour publier une version :
-
-```bash
-git tag v0.1.0 && git push --tags
-```
+Une Release est publiée **à chaque merge sur `main`** dont la version de `Cargo.toml` a changé (le workflow crée le tag `v<version>`). Chaque pull request incrémente donc la version.
 
 ## Lancer
 
@@ -49,12 +46,6 @@ cargo run --release
 Les connexions sont enregistrées dans `connections.json`, dans le dossier de configuration du système (`~/Library/Application Support/fr.gsoulat.Quarry/` sur macOS).
 
 Pour BigQuery, renseigne l'identifiant du projet et, au choix, le chemin d'une clé JSON de compte de service ou rien pour utiliser `gcloud auth application-default login`.
-
-Pour compiler sans BigQuery (binaire plus léger) :
-
-```bash
-cargo build --release --no-default-features
-```
 
 Pour produire une vraie application (`Quarry.app`, `.msi`, `.deb`) avec son icône :
 
@@ -93,14 +84,15 @@ src/
 ├── import.rs            import CSV / Excel / Parquet
 ├── completion.rs        autocomplétion SQL
 ├── tunnel.rs            tunnel SSH via le client ssh du système
+├── plugins.rs           registre, téléchargement et installation des connecteurs ; mise à jour de Quarry
 └── connector/
-    ├── mod.rs           trait Connector commun à tous les moteurs
-    ├── sql.rs           PostgreSQL / MySQL / SQLite via sqlx
-    ├── bigquery.rs      Google BigQuery (API REST)
-    └── plan.rs          lecture des différents formats d'EXPLAIN
+    ├── mod.rs           trait Connector + génération du SQL d'après le dialecte
+    ├── sqlite.rs        SQLite intégré
+    ├── process.rs       connecteur externe (processus enfant, JSON sur stdio)
+    └── plan.rs          ordre d'exécution, plan SQLite
 ```
 
-Pour ajouter un moteur (MongoDB/DocumentDB…), il suffit d'implémenter le trait `Connector` dans un nouveau module et de l'ajouter à `connector::connect`.
+Pour ajouter un moteur (DuckDB, MongoDB…), on écrit un connecteur dans [quarry-connectors](https://github.com/gsoulat/quarry-connectors) (un dossier, un exécutable, le protocole JSON décrit là-bas) et on ajoute sa variante à `store::Engine`.
 
 ## Feuille de route
 
@@ -111,6 +103,6 @@ Pour ajouter un moteur (MongoDB/DocumentDB…), il suffit d'implémenter le trai
 - [ ] Connecteur MongoDB / DocumentDB
 - [x] Diagramme des relations (MCD / MLD / MPD)
 - [ ] Positions du diagramme mémorisées par connexion
-- [ ] Connecteurs téléchargeables (processus séparés)
+- [x] Connecteurs téléchargeables (processus séparés)
 - [x] Édition des lignes et des tables par l'interface
 - [ ] Thème clair

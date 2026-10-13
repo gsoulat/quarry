@@ -7,6 +7,7 @@ use iced::widget::{
 use iced::{Background, Color, Element, Fill, Font};
 
 use crate::app::Message;
+use crate::plugins::{self, Installed, Registry};
 use crate::store::{ConnectionConfig, Engine};
 use crate::theme;
 
@@ -173,6 +174,13 @@ pub struct Manager {
     pub form: Form,
     pub feedback: Option<Feedback>,
     pub show_password: bool,
+    /// Page « Connecteurs » affichée à la place du formulaire.
+    pub plugins_page: bool,
+    pub installed: Vec<Installed>,
+    pub registry: Option<Registry>,
+    /// Connecteur en cours de téléchargement.
+    pub installing: Option<String>,
+    pub plugins_feedback: Option<Feedback>,
 }
 
 impl Manager {
@@ -182,16 +190,20 @@ impl Manager {
             form: Form::new(Engine::Postgres),
             feedback: None,
             show_password: false,
+            plugins_page: false,
+            installed: plugins::installed(),
+            registry: None,
+            installing: None,
+            plugins_feedback: None,
         }
     }
 
     pub fn edit(config: &ConnectionConfig) -> Self {
-        Self {
-            editing: Some(config.id),
-            form: Form::from_config(config),
-            feedback: None,
-            show_password: false,
-        }
+        Self { editing: Some(config.id), form: Form::from_config(config), ..Self::new() }
+    }
+
+    pub fn is_installed(&self, engine: Engine) -> bool {
+        engine.plugin_id().is_none_or(|id| self.installed.iter().any(|i| i.id == id))
     }
 }
 
@@ -213,13 +225,18 @@ pub fn view<'a>(manager: &'a Manager, connections: &'a [ConnectionConfig]) -> El
         scrollable(Column::with_children(list).spacing(2)).height(Fill),
         button(text("+ Nouvelle connexion").size(13))
             .on_press(Message::EditConnection(None))
-            .style(theme::list_item(manager.editing.is_none()))
+            .style(theme::list_item(manager.editing.is_none() && !manager.plugins_page))
+            .width(Fill),
+        button(text(format!("Connecteurs ({} installés)", manager.installed.len())).size(13))
+            .on_press(Message::OpenPlugins)
+            .style(theme::list_item(manager.plugins_page))
             .width(Fill),
     ]
     .spacing(8)
     .width(220);
 
-    let content = row![sidebar, form_view(manager)].spacing(20);
+    let right: Element<'_, Message> = if manager.plugins_page { plugins_view(manager) } else { form_view(manager) };
+    let content = row![sidebar, right].spacing(20);
 
     let dialog = container(content)
         .style(theme::panel)
@@ -261,8 +278,32 @@ fn form_view(manager: &Manager) -> Element<'_, Message> {
     ]
     .align_y(iced::Center);
 
-    let mut fields = column![
-        header,
+    let mut fields = column![header].spacing(12);
+    if !manager.is_installed(form.engine) {
+        let size = manager
+            .registry
+            .as_ref()
+            .and_then(|r| r.connectors.iter().find(|c| Some(c.id.as_str()) == form.engine.plugin_id()))
+            .and_then(|c| c.asset())
+            .map(|a| format!(" ({})", plugins::human_size(a.size)))
+            .unwrap_or_default();
+        fields = fields.push(
+            container(
+                row![
+                    text(format!("Le connecteur {} n'est pas installé.", form.engine)).size(13).color(theme::WARNING).width(Fill),
+                    button(text(format!("Télécharger{size}")).size(13))
+                        .on_press(Message::OpenPlugins)
+                        .padding([5, 12]),
+                ]
+                .spacing(10)
+                .align_y(iced::Center),
+            )
+            .style(theme::header_cell)
+            .padding([8, 12])
+            .width(Fill),
+        );
+    }
+    fields = fields.push(
         row![
             input("Nom", "Production, Docker local…", &form.name, Field::Name).width(Fill),
             input("Dossier", "Clients, Perso… (optionnel)", &form.folder, Field::Folder).width(Fill),
@@ -273,8 +314,7 @@ fn form_view(manager: &Manager) -> Element<'_, Message> {
             .spacing(4),
         ]
         .spacing(12),
-    ]
-    .spacing(12);
+    );
 
     fields = match form.engine {
         Engine::Postgres | Engine::MySql => {
@@ -372,4 +412,113 @@ fn form_view(manager: &Manager) -> Element<'_, Message> {
     .spacing(14)
     .width(Fill)
     .into()
+}
+
+/// Page « Connecteurs » : installés, disponibles, mises à jour.
+fn plugins_view(manager: &Manager) -> Element<'_, Message> {
+    let header = row![
+        text("Connecteurs").size(18).color(theme::TEXT).width(Fill),
+        button(text("Actualiser").size(13)).on_press(Message::PluginsRefresh).style(button::secondary).padding([5, 12]),
+        button(text("Fermer  ⎋").size(13)).on_press(Message::CloseManager).style(button::text),
+    ]
+    .spacing(8)
+    .align_y(iced::Center);
+
+    let intro = text(
+        "SQLite est intégré. Les autres moteurs sont des connecteurs téléchargés depuis GitHub \
+         (gsoulat/quarry-connectors), vérifiés par empreinte SHA-256 et installés dans le dossier de données de Quarry.",
+    )
+    .size(12)
+    .color(theme::MUTED);
+
+    let mut list = Column::new().spacing(6);
+    match &manager.registry {
+        None => list = list.push(text("Chargement du registre…").size(13).color(theme::MUTED)),
+        Some(registry) => {
+            for entry in &registry.connectors {
+                let installed = manager.installed.iter().find(|i| i.id == entry.id);
+                let busy = manager.installing.as_deref() == Some(entry.id.as_str());
+                let asset = entry.asset();
+                let status = match (installed, asset) {
+                    (Some(i), _) if plugins::is_newer(&i.version, &entry.version) => {
+                        format!("installé {} · mise à jour {} disponible", i.version, entry.version)
+                    }
+                    (Some(i), _) => format!("installé ({})", i.version),
+                    (None, Some(a)) => format!("non installé · {}", plugins::human_size(a.size)),
+                    (None, None) => format!("pas de version pour {}", plugins::TARGET),
+                };
+                let action: Element<'_, Message> = if busy {
+                    text("Téléchargement…").size(12).color(theme::WARNING).into()
+                } else {
+                    match (installed, asset) {
+                        (Some(i), Some(_)) if plugins::is_newer(&i.version, &entry.version) => {
+                            row![
+                                button(text("Mettre à jour").size(12)).on_press(Message::PluginInstall(entry.id.clone())).padding([4, 10]),
+                                button(text("Supprimer").size(12))
+                                    .on_press(Message::PluginRemove(entry.id.clone()))
+                                    .style(theme::outline(theme::DANGER))
+                                    .padding([4, 10]),
+                            ]
+                            .spacing(6)
+                            .into()
+                        }
+                        (Some(_), _) => button(text("Supprimer").size(12))
+                            .on_press(Message::PluginRemove(entry.id.clone()))
+                            .style(theme::outline(theme::DANGER))
+                            .padding([4, 10])
+                            .into(),
+                        (None, Some(_)) => button(text("Installer").size(12))
+                            .on_press(Message::PluginInstall(entry.id.clone()))
+                            .padding([4, 10])
+                            .into(),
+                        (None, None) => text("").into(),
+                    }
+                };
+                list = list.push(
+                    container(
+                        row![
+                            column![
+                                text(&entry.engine).size(14).color(theme::TEXT),
+                                text(&entry.description).size(12).color(theme::MUTED),
+                                text(status).size(11).color(theme::MUTED),
+                            ]
+                            .spacing(2)
+                            .width(Fill),
+                            action,
+                        ]
+                        .spacing(12)
+                        .align_y(iced::Center),
+                    )
+                    .style(theme::header_cell)
+                    .padding([10, 12])
+                    .width(Fill),
+                );
+            }
+            // Installés mais absents du registre (ancien connecteur, build local).
+            for i in manager.installed.iter().filter(|i| !registry.connectors.iter().any(|c| c.id == i.id)) {
+                list = list.push(
+                    row![
+                        text(format!("{} (installé {}, hors registre)", i.id, i.version)).size(13).width(Fill),
+                        button(text("Supprimer").size(12))
+                            .on_press(Message::PluginRemove(i.id.clone()))
+                            .style(theme::outline(theme::DANGER))
+                            .padding([4, 10]),
+                    ]
+                    .align_y(iced::Center),
+                );
+            }
+        }
+    }
+
+    let feedback = match &manager.plugins_feedback {
+        None => text(""),
+        Some(Feedback::Busy(m)) => text(m).color(theme::WARNING),
+        Some(Feedback::Ok(m)) => text(m).color(theme::SUCCESS),
+        Some(Feedback::Error(m)) => text(m).color(theme::DANGER),
+    };
+
+    column![header, intro, scrollable(list).height(Fill), feedback.size(13)]
+        .spacing(12)
+        .width(Fill)
+        .into()
 }

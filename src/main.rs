@@ -8,6 +8,7 @@ mod export;
 mod icon;
 mod import;
 mod manager;
+mod plugins;
 mod store;
 mod theme;
 mod tunnel;
@@ -15,7 +16,12 @@ mod tunnel;
 use app::App;
 
 fn main() -> iced::Result {
-    iced::application(App::new, App::update, App::view)
+    // Au démarrage : l'état, puis une vérification de mise à jour en arrière-plan.
+    let boot = || {
+        let app = App::new();
+        (app, iced::Task::perform(plugins::check_app_update(), app::Message::UpdateChecked))
+    };
+    iced::application(boot, App::update, App::view)
         .title(App::title)
         .theme(App::theme)
         .subscription(App::subscription)

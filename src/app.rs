@@ -13,7 +13,7 @@ use iced::widget::{
 use iced::{Color, Element, Event, Fill, Font, Length, Subscription, Task, Theme, highlighter, padding};
 
 use crate::connector::{
-    self, ColumnInfo, Connector, QueryPlan, QueryResult, Relation, Result, TableRef,
+    self, ColumnInfo, Connector, Dialect, QueryPlan, QueryResult, Relation, Result, TableRef,
     execution_order,
 };
 use crate::completion::{self, Completion};
@@ -23,6 +23,7 @@ use crate::editing::{self, Dialog, DialogMessage, Refresh, RenameForm, RowForm, 
 use crate::export::{self, Format};
 use crate::import::{self, ImportForm, ImportMessage};
 use crate::manager::{self, Feedback, Field, Manager};
+use crate::plugins;
 use crate::store::{self, ConnectionConfig, Engine, HistoryEntry, Location, SavedQuery};
 use crate::theme;
 use crate::tunnel::Tunnel;
@@ -149,6 +150,8 @@ pub struct App {
     diagram: Option<Diagram>,
     diagram_loading: bool,
     design: Design,
+    /// Dialecte de la session (copie pour les vues, qui empruntent `&self`).
+    dialect_cache: Dialect,
     /// Colonnes connues, pour l'autocomplétion (chargées en arrière-plan).
     columns_cache: HashMap<TableRef, Vec<ColumnInfo>>,
     completion: Option<Completion>,
@@ -168,6 +171,8 @@ pub struct App {
     import_error: Option<String>,
     /// Menu « Édition » déroulé.
     edit_menu: bool,
+    /// Nouvelle version de Quarry publiée sur GitHub.
+    update: Option<plugins::AppUpdate>,
     selected: Option<TableRef>,
     schema: Vec<ColumnInfo>,
     tab: Tab,
@@ -228,6 +233,14 @@ pub enum Message {
     FormChanged(Field, String),
     FormEngine(Engine),
     TogglePassword,
+    OpenPlugins,
+    PluginsRefresh,
+    PluginsLoaded(Result<plugins::Registry>),
+    PluginInstall(String),
+    PluginInstalled(Result<plugins::Installed>),
+    PluginRemove(String),
+    UpdateChecked(Result<Option<plugins::AppUpdate>>),
+    OpenUrl(String),
     TestConnection,
     TestDone(Result<String>),
     SaveConnection { connect: bool },
@@ -325,6 +338,7 @@ impl App {
             diagram: None,
             diagram_loading: false,
             design: Design::default(),
+            dialect_cache: editing::default_dialect(),
             columns_cache: HashMap::new(),
             completion: None,
             data: None,
@@ -339,6 +353,7 @@ impl App {
             import: None,
             import_error: None,
             edit_menu: false,
+            update: None,
             selected: None,
             schema: Vec::new(),
             tabs: vec![QueryTab::new(1, "Requête 1".into(), "SELECT 1 AS hello")],
@@ -380,6 +395,11 @@ impl App {
 
     fn connector(&self) -> Option<Arc<dyn Connector>> {
         self.session.as_ref().map(|s| s.connector.clone())
+    }
+
+    /// Dialecte de la connexion ouverte, ou SQL standard à défaut.
+    fn dialect(&self) -> Dialect {
+        self.session.as_ref().map_or_else(editing::default_dialect, |s| s.connector.dialect().clone())
     }
 
     fn tab(&self) -> &QueryTab {
@@ -468,6 +488,7 @@ impl App {
                     if tunnel.is_some() { " via tunnel SSH" } else { "" }
                 ));
                 self.persist_tabs();
+                self.dialect_cache = c.dialect().clone();
                 self.session = Some(Session {
                     id,
                     connector: c.clone(),
@@ -492,6 +513,7 @@ impl App {
             Message::Disconnect => {
                 self.persist_tabs();
                 self.session = None;
+                self.dialect_cache = editing::default_dialect();
                 self.history.clear();
                 self.selected = None;
                 self.schema.clear();
@@ -827,6 +849,72 @@ impl App {
                     m.show_password = !m.show_password;
                 }
             }
+            Message::OpenPlugins => {
+                let m = self.manager.get_or_insert_with(Manager::new);
+                m.plugins_page = true;
+                m.installed = plugins::installed();
+                if m.registry.is_none() {
+                    return self.update(Message::PluginsRefresh);
+                }
+            }
+            Message::PluginsRefresh => {
+                if let Some(m) = &mut self.manager {
+                    m.plugins_feedback = Some(Feedback::Busy("Lecture du registre…".into()));
+                    m.installed = plugins::installed();
+                }
+                return Task::perform(plugins::fetch_registry(), Message::PluginsLoaded);
+            }
+            Message::PluginsLoaded(result) => {
+                if let Some(m) = &mut self.manager {
+                    match result {
+                        Ok(registry) => {
+                            m.plugins_feedback = Some(Feedback::Ok(format!(
+                                "{} connecteur(s) disponibles (registre {})",
+                                registry.connectors.len(),
+                                registry.tag
+                            )));
+                            m.registry = Some(registry);
+                        }
+                        Err(e) => m.plugins_feedback = Some(Feedback::Error(e)),
+                    }
+                }
+            }
+            Message::PluginInstall(id) => {
+                let Some(m) = &mut self.manager else { return Task::none() };
+                let Some(entry) = m.registry.as_ref().and_then(|r| r.connectors.iter().find(|c| c.id == id)).cloned() else {
+                    return Task::none();
+                };
+                m.installing = Some(id.clone());
+                m.plugins_feedback = Some(Feedback::Busy(format!("Téléchargement de {}…", entry.engine)));
+                return Task::perform(plugins::install(entry), Message::PluginInstalled);
+            }
+            Message::PluginInstalled(result) => {
+                if let Some(m) = &mut self.manager {
+                    m.installing = None;
+                    m.installed = plugins::installed();
+                    m.plugins_feedback = Some(match result {
+                        Ok(i) => Feedback::Ok(format!("{} {} installé", i.id, i.version)),
+                        Err(e) => Feedback::Error(e),
+                    });
+                }
+            }
+            Message::PluginRemove(id) => {
+                if let Some(m) = &mut self.manager {
+                    m.plugins_feedback = Some(match plugins::remove(&id) {
+                        Ok(()) => Feedback::Ok(format!("{id} supprimé")),
+                        Err(e) => Feedback::Error(e),
+                    });
+                    m.installed = plugins::installed();
+                }
+            }
+            Message::UpdateChecked(Ok(update)) => self.update = update,
+            // Dépôt privé ou hors ligne : on reste silencieux.
+            Message::UpdateChecked(Err(_)) => {}
+            Message::OpenUrl(url) => {
+                if let Err(e) = open::that(&url) {
+                    self.status = Status::Error(format!("Impossible d'ouvrir {url} : {e}"));
+                }
+            }
             Message::TestConnection => {
                 let Some(m) = &mut self.manager else { return Task::none() };
                 let config = match m.form.to_config(m.editing.unwrap_or(0)) {
@@ -1067,8 +1155,7 @@ impl App {
             Message::ImportRead(Ok(Some((path, file)))) => {
                 self.status = Status::Info(format!("{} ligne(s) lue(s)", file.rows.len()));
                 let existing = self.selected.clone().filter(|_| !self.schema.is_empty()).map(|t| (t, self.schema.clone()));
-                let engine = self.active_config().map_or(Engine::Postgres, |c| c.engine);
-                let mut form = ImportForm::new(path, file, existing, engine);
+                let mut form = ImportForm::new(path, file, existing, self.dialect().import_types);
                 if form.new_schema.is_none()
                     && let Some(session) = &self.session
                 {
@@ -1158,13 +1245,8 @@ impl App {
     fn update_design(&mut self, message: DesignMessage) -> Task<Message> {
         use DesignMessage as M;
 
-        let engine = self.active_config().map_or(Engine::Postgres, |c| c.engine);
-        let id_type = match engine {
-            Engine::Postgres => "SERIAL",
-            Engine::MySql => "INT",
-            Engine::Sqlite => "INTEGER",
-            Engine::BigQuery => "INT64",
-        };
+        let id_type = self.dialect().id_type;
+        let id_type = id_type.as_str();
 
         // Le connecteur est pris avant l'emprunt mutable du diagramme.
         let connector = self.connector();
@@ -1359,12 +1441,11 @@ impl App {
         if let Some(m) = &self.manager {
             return stack![base, manager::view(m, &self.connections)].into();
         }
-        let engine = self.active_config().map_or(Engine::Postgres, |c| c.engine);
         if let Some(form) = &self.import {
             return stack![base, import::view(form, self.import_error.as_deref())].into();
         }
         match &self.dialog {
-            Some(d) => stack![base, editing::view(d, self.dialog_error.as_deref(), engine)].into(),
+            Some(d) => stack![base, editing::view(d, self.dialog_error.as_deref(), &self.dialect_cache)].into(),
             None => base.into(),
         }
     }
@@ -1392,16 +1473,17 @@ impl App {
             .style(theme::outline(theme::PRIMARY))
             .padding([5, 12]);
 
-        container(
-            row![
-                text("Quarry").size(20).color(theme::PRIMARY),
-                container(active).width(Fill),
-                edit,
-                disconnect,
-            ]
-            .spacing(16)
-            .align_y(iced::Center),
-        )
+        let mut bar = row![text("Quarry").size(20).color(theme::PRIMARY), container(active).width(Fill)];
+        if let Some(u) = &self.update {
+            bar = bar.push(
+                button(text(format!("Mise à jour {} disponible", u.version)).size(13))
+                    .on_press(Message::OpenUrl(u.url.clone()))
+                    .style(theme::outline(theme::SUCCESS))
+                    .padding([5, 12]),
+            );
+        }
+        let bar = bar.push(edit).push(disconnect);
+        container(bar.spacing(16).align_y(iced::Center))
         .style(theme::top_bar)
         .padding([8, 14])
         .width(Fill)
@@ -1934,7 +2016,8 @@ impl App {
             schemas.sort_unstable();
             schemas.dedup();
         }
-        Some(Dialog::Table(TableForm::new(schemas, config.engine)))
+        let _ = config;
+        Some(Dialog::Table(TableForm::new(schemas, &self.dialect().id_type)))
     }
 
     fn dialog_rename_table(&self) -> Option<Dialog> {
@@ -2263,8 +2346,7 @@ impl App {
         let canvas = Element::from(canvas).map(Message::DiagramInteraction);
 
         let body: Element<'_, Message> = if d.editable {
-            let engine = self.active_config().map_or(Engine::Postgres, |c| c.engine);
-            row![canvas, design::panel(&self.design, d, engine)].spacing(8).into()
+            row![canvas, design::panel(&self.design, d, &self.dialect_cache)].spacing(8).into()
         } else {
             canvas
         };
