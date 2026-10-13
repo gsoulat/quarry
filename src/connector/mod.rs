@@ -135,14 +135,23 @@ pub trait Connector: Send + Sync + fmt::Debug {
             .join(" AND ")
     }
 
+    /// `SELECT` des `n` premières lignes, dans la syntaxe du moteur
+    /// (`LIMIT` par défaut, ou le modèle `preview_sql` du dialecte).
+    fn select_first(&self, table: &TableRef, n: usize) -> String {
+        match &self.dialect().preview_sql {
+            Some(template) => template.replace("{table}", &self.quote_table(table)).replace("{n}", &n.to_string()),
+            None => format!("SELECT * FROM {} LIMIT {n}", self.quote_table(table)),
+        }
+    }
+
     /// Requête d'aperçu proposée quand on clique sur une table.
     fn preview_sql(&self, table: &TableRef) -> String {
-        format!("SELECT * FROM {} LIMIT 100", self.quote_table(table))
+        self.select_first(table, 100)
     }
 
     /// Toutes les lignes de la table (bornées par `MAX_ROWS` à la lecture).
     fn data_sql(&self, table: &TableRef) -> String {
-        format!("SELECT * FROM {} LIMIT {MAX_ROWS}", self.quote_table(table))
+        self.select_first(table, MAX_ROWS)
     }
 
     fn insert_sql(&self, table: &TableRef, values: &[(String, Input)]) -> String {
@@ -197,7 +206,12 @@ pub trait Connector: Send + Sync + fmt::Debug {
         if !pk.is_empty() {
             lines.push(format!("    PRIMARY KEY ({})", pk.join(", ")));
         }
-        format!("CREATE TABLE {} (\n{}\n)", self.quote_table(table), lines.join(",\n"))
+        let mut sql = format!("CREATE TABLE {} (\n{}\n)", self.quote_table(table), lines.join(",\n"));
+        if let Some(suffix) = &self.dialect().create_table_suffix {
+            sql.push(' ');
+            sql.push_str(suffix);
+        }
+        sql
     }
 
     /// `None` si le moteur n'a pas de schémas (SQLite).
@@ -229,11 +243,21 @@ pub trait Connector: Send + Sync + fmt::Debug {
         match alter {
             Alter::AddColumn(column) => format!("ALTER TABLE {quoted}\nADD COLUMN {}", self.column_ddl(column)),
             Alter::DropColumn(name) => format!("ALTER TABLE {quoted}\nDROP COLUMN {}", self.quote_identifier(name)),
-            Alter::RenameColumn { from, to } => format!(
-                "ALTER TABLE {quoted}\nRENAME COLUMN {} TO {}",
-                self.quote_identifier(from),
-                self.quote_identifier(to)
-            ),
+            Alter::RenameColumn { from, to } => match &self.dialect().rename_column_sql {
+                Some(template) => template
+                    .replace("{table}", &self.quote_table(table))
+                    .replace("{from}", from)
+                    .replace("{to}", to),
+                None => format!(
+                    "ALTER TABLE {quoted}\nRENAME COLUMN {} TO {}",
+                    self.quote_identifier(from),
+                    self.quote_identifier(to)
+                ),
+            },
+            Alter::RenameTable(to) if self.dialect().rename_table_sql.is_some() => {
+                let template = self.dialect().rename_table_sql.clone().unwrap_or_default();
+                template.replace("{table}", &self.quote_table(table)).replace("{to}", to)
+            }
             Alter::RenameTable(to) if self.dialect().rename_table_statement => {
                 format!("RENAME TABLE {quoted} TO {}", self.quote_identifier(to))
             }
@@ -242,8 +266,13 @@ pub trait Connector: Send + Sync + fmt::Debug {
     }
 }
 
-/// Ouvre une connexion enregistrée, avec son mot de passe éventuel.
-pub async fn connect(config: &ConnectionConfig, password: Option<String>) -> Result<Arc<dyn Connector>> {
+/// Ouvre une connexion enregistrée, avec son mot de passe éventuel et ses
+/// champs propres (secrets déjà résolus).
+pub async fn connect(
+    config: &ConnectionConfig,
+    password: Option<String>,
+    options: std::collections::HashMap<String, String>,
+) -> Result<Arc<dyn Connector>> {
     let engine = &config.engine;
     match engine.plugin_id() {
         None if engine.id == "sqlite" => Ok(Arc::new(sqlite::Sqlite::connect(&config.path).await?)),
@@ -262,6 +291,7 @@ pub async fn connect(config: &ConnectionConfig, password: Option<String>) -> Res
                 project_id: config.project_id.clone(),
                 credentials_path: config.credentials_path.clone(),
                 max_rows: MAX_ROWS,
+                options,
             };
             Ok(Arc::new(process::ProcessConnector::launch(&binary, params).await?))
         }
@@ -287,6 +317,10 @@ pub(crate) mod test_support {
                 types: vec!["INTEGER".into(), "TEXT".into()],
                 id_type: "INTEGER".into(),
                 import_types: ["BIGINT".into(), "DOUBLE PRECISION".into(), "BOOLEAN".into(), "TEXT".into()],
+                create_table_suffix: None,
+                preview_sql: None,
+                rename_table_sql: None,
+                rename_column_sql: None,
             })
         }
     }
@@ -341,6 +375,24 @@ mod tests {
         assert_eq!(fake.quote_literal("C:\\x'y"), "'C:\\\\x''y'");
         assert_eq!(fake.alter_table_sql(&t, &Alter::RenameTable("people".into())), "RENAME TABLE `users` TO `people`");
         assert_eq!(fake.create_schema_sql("app").unwrap(), "CREATE DATABASE `app`");
+    }
+
+    #[test]
+    fn sql_server_templates_are_applied() {
+        let mut fake = Fake::standard();
+        fake.0.preview_sql = Some("SELECT TOP {n} * FROM {table}".into());
+        fake.0.rename_table_sql = Some("EXEC sp_rename '{table}', '{to}'".into());
+        fake.0.rename_column_sql = Some("EXEC sp_rename '{table}.{from}', '{to}', 'COLUMN'".into());
+        let t = TableRef { schema: Some("dbo".into()), name: "users".into() };
+        assert_eq!(fake.preview_sql(&t), "SELECT TOP 100 * FROM \"dbo\".\"users\"");
+        assert_eq!(fake.alter_table_sql(&t, &Alter::RenameTable("people".into())), "EXEC sp_rename '\"dbo\".\"users\"', 'people'");
+        assert_eq!(
+            fake.alter_table_sql(&t, &Alter::RenameColumn { from: "name".into(), to: "full_name".into() }),
+            "EXEC sp_rename '\"dbo\".\"users\".name', 'full_name', 'COLUMN'"
+        );
+        fake.0.create_table_suffix = Some("ENGINE = MergeTree ORDER BY tuple()".into());
+        let ddl = fake.create_table_sql(&t, &[ColumnDef { name: "id".into(), data_type: "UInt64".into(), nullable: false, primary_key: false }]);
+        assert!(ddl.ends_with(") ENGINE = MergeTree ORDER BY tuple()"));
     }
 
     #[test]

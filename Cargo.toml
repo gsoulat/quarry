@@ -1,6 +1,6 @@
 [package]
 name = "quarry"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Client de bases de données léger et multiplateforme, écrit en Rust avec iced"
 
@@ -17,7 +17,7 @@ keyring = "4"
 open = "5"
 parquet = { version = "60", default-features = false, features = ["snap", "zstd", "lz4", "brotli", "flate2", "flate2-rust_backend", "json"] }
 png = "0.18.1"
-quarry-protocol = { git = "https://github.com/gsoulat/quarry-connectors", tag = "v0.1.0", version = "0.1.0" }
+quarry-protocol = { git = "https://github.com/gsoulat/quarry-connectors", rev = "a6e656e", version = "0.1.0" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 rfd = "0.17"
 rust_xlsxwriter = "0.99"

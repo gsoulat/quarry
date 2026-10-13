@@ -123,6 +123,7 @@ mod tests {
             ssh_port: Some(2222),
             ssh_user: "ubuntu".into(),
             ssh_key: "~/.ssh/id_ed25519".into(),
+            extra: Default::default(),
         };
         let args = ssh_args(&config, 50000);
         assert!(args.contains(&"-N".to_string()));

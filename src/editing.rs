@@ -31,6 +31,10 @@ pub fn default_dialect() -> Dialect {
             .to_vec(),
         id_type: "INTEGER".into(),
         import_types: ["BIGINT".into(), "DOUBLE PRECISION".into(), "BOOLEAN".into(), "TEXT".into()],
+        create_table_suffix: None,
+        preview_sql: None,
+        rename_table_sql: None,
+        rename_column_sql: None,
     }
 }
 

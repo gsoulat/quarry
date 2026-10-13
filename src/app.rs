@@ -233,6 +233,7 @@ pub enum Message {
     CloseManager,
     EditConnection(Option<u64>),
     FormChanged(Field, String),
+    FormExtra(String, String),
     FormEngine(Engine),
     TogglePassword,
     OpenPlugins,
@@ -291,14 +292,21 @@ async fn open(
         None if config.engine.is_server() => store::password(config.id)?,
         None => None,
     };
+    // Champs déclarés par le moteur : valeurs du fichier + secrets du trousseau.
+    let mut options = config.extra.clone();
+    for field in config.engine.fields.iter().filter(|f| f.secret) {
+        if let Some(v) = store::secret(config.id, &field.key)? {
+            options.insert(field.key.clone(), v);
+        }
+    }
     if config.uses_tunnel() {
         let tunnel = Tunnel::open(&config).await?;
         // La base est atteinte par le port local du tunnel.
         let local = ConnectionConfig { host: "127.0.0.1".into(), port: Some(tunnel.local_port), ..config };
-        let connector = connector::connect(&local, password).await?;
+        let connector = connector::connect(&local, password, options).await?;
         return Ok((connector, Some(Arc::new(tunnel))));
     }
-    Ok((connector::connect(&config, password).await?, None))
+    Ok((connector::connect(&config, password, options).await?, None))
 }
 
 impl App {
@@ -845,6 +853,11 @@ impl App {
             Message::FormChanged(field, value) => {
                 if let Some(m) = &mut self.manager {
                     m.form.set(field, value);
+                }
+            }
+            Message::FormExtra(key, value) => {
+                if let Some(m) = &mut self.manager {
+                    m.form.extra.insert(key, value);
                 }
             }
             Message::FormEngine(engine) => {
@@ -1401,6 +1414,12 @@ impl App {
         let mut result = Ok(());
         if config.engine.is_server() && !m.form.password.is_empty() {
             result = store::set_password(id, &m.form.password);
+        }
+        // Champs secrets : au trousseau, et jamais dans le fichier.
+        for field in config.engine.fields.iter().filter(|f| f.secret) {
+            if let Some(v) = m.form.extra.get(&field.key).filter(|v| !v.is_empty()) {
+                result = result.and(store::set_secret(id, &field.key, v));
+            }
         }
         match self.connections.iter_mut().find(|c| c.id == id) {
             Some(existing) => *existing = config,
