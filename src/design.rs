@@ -10,8 +10,7 @@ use iced::{Background, Color, Element, Fill, Font};
 
 use crate::app::Message;
 use crate::diagram::{Diagram, LinkKind};
-use crate::editing::type_options;
-use crate::store::Engine;
+use crate::connector::Dialect;
 use crate::theme;
 
 const MONO: Font = Font::MONOSPACE;
@@ -50,7 +49,7 @@ pub struct Design {
     pub pending_link: Option<(usize, usize)>,
 }
 
-pub fn panel<'a>(design: &'a Design, diagram: &'a Diagram, engine: Engine) -> Element<'a, Message> {
+pub fn panel<'a>(design: &'a Design, diagram: &'a Diagram, dialect: &'a Dialect) -> Element<'a, Message> {
     let msg = |m: DesignMessage| Message::Design(m);
 
     let Some(index) = diagram.selected else {
@@ -106,7 +105,7 @@ pub fn panel<'a>(design: &'a Design, diagram: &'a Diagram, engine: Engine) -> El
             .spacing(2)
             .into()
         } else {
-            let mut options: Vec<String> = type_options(engine).iter().map(|t| t.to_string()).collect();
+            let mut options: Vec<String> = dialect.types.clone();
             if !col.data_type.is_empty() && !options.contains(&col.data_type) {
                 options.insert(0, col.data_type.clone());
             }

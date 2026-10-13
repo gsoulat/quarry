@@ -1,9 +1,14 @@
-# Construit Quarry pour macOS, Linux et Windows et attache les archives à
-# la Release GitHub du tag. Déclenchement : `git tag v0.1.0 && git push --tags`.
+# Une Release à chaque merge sur main : le workflow lit la version de
+# Cargo.toml, crée le tag `v<version>` s'il n'existe pas encore, construit
+# Quarry pour macOS (Apple Silicon et Intel), Linux et Windows, et attache
+# les archives à la Release GitHub. Chaque pull request doit donc
+# incrémenter la version dans Cargo.toml ; sans changement de version, rien
+# n'est publié.
 name: Release
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
 
 permissions:
@@ -13,8 +18,43 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  version:
+    name: Version et tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.decide.outputs.tag }}
+      publish: ${{ steps.decide.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: decide
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          version=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          tag="v${version}"
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "Le tag ${tag} existe déjà : pas de nouvelle release."
+            echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git tag "${tag}"
+            git push origin "${tag}"
+            echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: ${{ matrix.name }}
+    needs: version
+    if: needs.version.outputs.publish == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -23,20 +63,20 @@ jobs:
           - name: macOS (Apple Silicon)
             os: macos-14
             target: aarch64-apple-darwin
-            archive: Quarry-${{ github.ref_name }}-macos-apple-silicon.zip
-          # Compilé en croisé depuis le runner Apple Silicon (macos-13 n'existe plus).
+            archive: Quarry-${{ needs.version.outputs.tag }}-macos-apple-silicon.zip
+          # Compilé en croisé depuis le runner Apple Silicon.
           - name: macOS (Intel)
             os: macos-14
             target: x86_64-apple-darwin
-            archive: Quarry-${{ github.ref_name }}-macos-intel.zip
+            archive: Quarry-${{ needs.version.outputs.tag }}-macos-intel.zip
           - name: Linux (x86_64)
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            archive: Quarry-${{ github.ref_name }}-linux-x86_64.tar.gz
+            archive: Quarry-${{ needs.version.outputs.tag }}-linux-x86_64.tar.gz
           - name: Windows (x86_64)
             os: windows-latest
             target: x86_64-pc-windows-msvc
-            archive: Quarry-${{ github.ref_name }}-windows-x86_64.zip
+            archive: Quarry-${{ needs.version.outputs.tag }}-windows-x86_64.zip
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -85,7 +125,8 @@ jobs:
 
   release:
     name: Publier la Release
-    needs: build
+    needs: [version, build]
+    if: needs.version.outputs.publish == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -94,6 +135,7 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.version.outputs.tag }}
           files: artifacts/*
           generate_release_notes: true
           body: |
@@ -103,3 +145,5 @@ jobs:
               au premier lancement, clic droit → Ouvrir (ou Réglages → Confidentialité et sécurité → Ouvrir quand même).
             - **Linux** : `tar xzf` puis lance `./quarry`.
             - **Windows** : dézippe et lance `Quarry.exe`. SmartScreen peut demander confirmation (exécutable non signé).
+
+            Les connecteurs (PostgreSQL, MySQL, BigQuery…) se téléchargent depuis l'application : Gérer → Connecteurs.

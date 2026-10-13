@@ -33,6 +33,16 @@ impl Engine {
     pub fn is_server(self) -> bool {
         matches!(self, Engine::Postgres | Engine::MySql)
     }
+
+    /// Identifiant du connecteur téléchargeable ; `None` pour SQLite, intégré.
+    pub fn plugin_id(self) -> Option<&'static str> {
+        match self {
+            Engine::Postgres => Some("postgres"),
+            Engine::MySql => Some("mysql"),
+            Engine::BigQuery => Some("bigquery"),
+            Engine::Sqlite => None,
+        }
+    }
 }
 
 impl fmt::Display for Engine {
@@ -137,6 +147,11 @@ impl ConnectionConfig {
         }
     }
 }
+
+/// Verrou partagé par les tests qui modifient `QUARRY_CONFIG_DIR` (une
+/// variable d'environnement est globale au processus).
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Dossier de configuration. `QUARRY_CONFIG_DIR` le remplace (tests,
 /// profils séparés).
@@ -328,7 +343,7 @@ mod tests {
         result
     }
 
-    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use super::TEST_ENV_LOCK as SERIAL;
 
     #[test]
     fn queries_round_trip_per_connection() {

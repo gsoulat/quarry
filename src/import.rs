@@ -10,7 +10,6 @@ use iced::{Element, Fill, Font};
 use crate::app::Message;
 use crate::connector::{Cell, ColumnDef, ColumnInfo, Connector, Input, TableRef};
 use crate::editing::{Pending, Refresh};
-use crate::store::Engine;
 use crate::theme;
 
 const MONO: Font = Font::MONOSPACE;
@@ -142,14 +141,10 @@ pub fn read_file(path: &Path) -> Result<ImportedFile, String> {
     }
 }
 
-/// Type de colonne déduit du contenu, dans le dialecte du moteur.
-pub fn infer_type(column: usize, rows: &[Vec<Cell>], engine: Engine) -> &'static str {
-    let (int, float, boolean, text) = match engine {
-        Engine::Postgres => ("BIGINT", "DOUBLE PRECISION", "BOOLEAN", "TEXT"),
-        Engine::MySql => ("BIGINT", "DOUBLE", "BOOLEAN", "TEXT"),
-        Engine::Sqlite => ("INTEGER", "REAL", "INTEGER", "TEXT"),
-        Engine::BigQuery => ("INT64", "FLOAT64", "BOOL", "STRING"),
-    };
+/// Type de colonne déduit du contenu, dans le dialecte du moteur
+/// (`import_types` : entier, flottant, booléen, texte).
+pub fn infer_type(column: usize, rows: &[Vec<Cell>], import_types: &[String; 4]) -> String {
+    let [int, float, boolean, text] = import_types;
     let mut seen_int = false;
     let mut seen_float = false;
     let mut seen_bool = false;
@@ -159,17 +154,17 @@ pub fn infer_type(column: usize, rows: &[Vec<Cell>], engine: Engine) -> &'static
             Some(Cell::Int(_)) => seen_int = true,
             Some(Cell::Float(_)) => seen_float = true,
             Some(Cell::Bool(_)) => seen_bool = true,
-            Some(_) => return text,
+            Some(_) => return text.clone(),
         }
     }
     if seen_float {
-        float
+        float.clone()
     } else if seen_int {
-        int
+        int.clone()
     } else if seen_bool {
-        boolean
+        boolean.clone()
     } else {
-        text
+        text.clone()
     }
 }
 
@@ -257,7 +252,7 @@ pub struct ImportForm {
     pub new_name: String,
     /// Pour Target::Existing : colonne cible par colonne du fichier.
     pub mapping: Vec<Option<usize>>,
-    pub engine: Engine,
+    pub import_types: [String; 4],
 }
 
 #[derive(Debug, Clone)]
@@ -271,7 +266,7 @@ pub enum ImportMessage {
 }
 
 impl ImportForm {
-    pub fn new(path: PathBuf, file: ImportedFile, existing: Option<(TableRef, Vec<ColumnInfo>)>, engine: Engine) -> Self {
+    pub fn new(path: PathBuf, file: ImportedFile, existing: Option<(TableRef, Vec<ColumnInfo>)>, import_types: [String; 4]) -> Self {
         let mapping = existing.as_ref().map(|(_, cols)| auto_mapping(&file.columns, cols)).unwrap_or_default();
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("import");
         let new_schema = existing.as_ref().and_then(|(t, _)| t.schema.clone());
@@ -283,7 +278,7 @@ impl ImportForm {
             path,
             file,
             existing,
-            engine,
+            import_types,
         }
     }
 
@@ -327,7 +322,7 @@ impl ImportForm {
                     .enumerate()
                     .map(|(i, col)| ColumnDef {
                         name: normalize(col),
-                        data_type: infer_type(i, &self.file.rows, self.engine).into(),
+                        data_type: infer_type(i, &self.file.rows, &self.import_types),
                         nullable: true,
                         primary_key: false,
                     })
@@ -404,7 +399,7 @@ pub fn view<'a>(form: &'a ImportForm, error: Option<&'a str>) -> Element<'a, Mes
             let types = form.file.columns.iter().enumerate().map(|(i, c)| {
                 row![
                     text(normalize(c)).size(12).font(MONO).width(Fill),
-                    text(infer_type(i, &form.file.rows, form.engine)).size(12).color(theme::MUTED),
+                    text(infer_type(i, &form.file.rows, &form.import_types)).size(12).color(theme::MUTED),
                 ]
                 .spacing(8)
                 .into()
@@ -501,9 +496,10 @@ mod tests {
         assert_eq!(file.columns, ["Nom", "Âge", "Score"]);
         assert_eq!(file.rows.len(), 2);
         assert!(matches!(file.rows[1][1], Cell::Null));
-        assert_eq!(infer_type(0, &file.rows, Engine::Postgres), "TEXT");
-        assert_eq!(infer_type(1, &file.rows, Engine::Postgres), "BIGINT");
-        assert_eq!(infer_type(2, &file.rows, Engine::Postgres), "DOUBLE PRECISION");
+        let pg = ["BIGINT".to_string(), "DOUBLE PRECISION".into(), "BOOLEAN".into(), "TEXT".into()];
+        assert_eq!(infer_type(0, &file.rows, &pg), "TEXT");
+        assert_eq!(infer_type(1, &file.rows, &pg), "BIGINT");
+        assert_eq!(infer_type(2, &file.rows, &pg), "DOUBLE PRECISION");
         assert_eq!(normalize("Âge (ans)"), "âge_ans");
         let _ = std::fs::remove_dir_all(&dir);
     }
