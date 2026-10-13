@@ -1,4 +1,5 @@
 mod app;
+mod completion;
 mod connector;
 mod design;
 mod diagram;

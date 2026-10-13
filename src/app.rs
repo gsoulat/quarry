@@ -1,6 +1,6 @@
 //! État de l'application, messages et vues (architecture Elm d'iced).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,7 @@ use crate::connector::{
     self, ColumnInfo, Connector, QueryPlan, QueryResult, Relation, Result, TableRef,
     execution_order,
 };
+use crate::completion::{self, Completion};
 use crate::design::{self, Design, DesignMessage};
 use crate::diagram::{self, Diagram};
 use crate::editing::{self, Dialog, DialogMessage, Refresh, RenameForm, RowForm, TableForm};
@@ -144,6 +145,9 @@ pub struct App {
     diagram: Option<Diagram>,
     diagram_loading: bool,
     design: Design,
+    /// Colonnes connues, pour l'autocomplétion (chargées en arrière-plan).
+    columns_cache: HashMap<TableRef, Vec<ColumnInfo>>,
+    completion: Option<Completion>,
     /// Lignes de la table sélectionnée (onglet Données).
     data: Option<QueryResult>,
     data_table: Option<TableRef>,
@@ -172,6 +176,10 @@ pub enum Message {
     Disconnect,
     TablesLoaded(Result<Vec<TableRef>>),
     SchemasLoaded(Result<Vec<String>>),
+    ColumnsCached(Vec<(TableRef, Vec<ColumnInfo>)>),
+    CompletionMove(i32),
+    CompletionAccept,
+    CompletionClose,
     TableSelected(TableRef),
     InsertTable(TableRef),
     SchemaLoaded(Result<Vec<ColumnInfo>>),
@@ -297,6 +305,8 @@ impl App {
             diagram: None,
             diagram_loading: false,
             design: Design::default(),
+            columns_cache: HashMap::new(),
+            completion: None,
             data: None,
             data_table: None,
             data_row: None,
@@ -363,6 +373,17 @@ impl App {
     fn current_sql(&self) -> String {
         let editor = &self.tab().editor;
         editor.selection().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| editor.text())
+    }
+
+    /// Propositions pour le mot sous le curseur de l'onglet actif.
+    fn compute_completion(&self) -> Option<Completion> {
+        let editor = &self.tab().editor;
+        let cursor = editor.cursor();
+        let (line, column) = (cursor.position.line, cursor.position.column);
+        let line_text = editor.line(line)?.text.to_string();
+        let before: String = line_text.chars().take(column).collect();
+        let tables: Vec<TableRef> = self.session.as_ref().map(|s| s.tables.clone()).unwrap_or_default();
+        completion::suggest(&before, &editor.text(), line, column, &tables, &self.columns_cache)
     }
 
     /// Recharge la liste des tables et des schémas de la connexion ouverte.
@@ -453,12 +474,32 @@ impl App {
                 }
             }
             Message::TablesLoaded(Ok(tables)) => {
+                let describe_all = self.connector().map(|c| {
+                    let tables = tables.clone();
+                    Task::perform(
+                        async move {
+                            let mut out = Vec::new();
+                            for t in tables {
+                                if let Ok(cols) = c.describe_table(&t).await {
+                                    out.push((t, cols));
+                                }
+                            }
+                            out
+                        },
+                        Message::ColumnsCached,
+                    )
+                });
                 if let Some(session) = &mut self.session {
                     session.tables = tables;
                 }
+                self.columns_cache.clear();
+                let mut tasks = Vec::new();
+                if let Some(t) = describe_all {
+                    tasks.push(t);
+                }
                 // Diagramme ouvert : on le recharge avec la nouvelle structure.
                 if self.tab == Tab::Diagram && self.diagram.is_none() && !self.diagram_loading {
-                    return self.update(Message::LoadDiagram);
+                    tasks.push(self.update(Message::LoadDiagram));
                 }
                 // Table sélectionnée encore présente : on relit son schéma
                 // (et ses lignes si l'onglet Données est ouvert).
@@ -467,9 +508,30 @@ impl App {
                     .as_ref()
                     .is_some_and(|t| self.session.as_ref().is_some_and(|s| s.tables.contains(t)));
                 if still_there {
-                    return self.update(Message::TableSelected(self.selected.clone().unwrap()));
+                    tasks.push(self.update(Message::TableSelected(self.selected.clone().unwrap())));
+                } else {
+                    self.selected = None;
                 }
-                self.selected = None;
+                return Task::batch(tasks);
+            }
+            Message::ColumnsCached(all) => {
+                self.columns_cache = all.into_iter().collect();
+            }
+            Message::CompletionMove(delta) => {
+                if let Some(c) = &mut self.completion {
+                    let n = c.items.len() as i32;
+                    c.selected = ((c.selected as i32 + delta).rem_euclid(n)) as usize;
+                }
+            }
+            Message::CompletionClose => self.completion = None,
+            Message::CompletionAccept => {
+                let Some(c) = self.completion.take() else { return Task::none() };
+                let Some(item) = c.items.get(c.selected).cloned() else { return Task::none() };
+                let editor = &mut self.tab_mut().editor;
+                for _ in 0..c.prefix_len {
+                    editor.perform(Action::Edit(Edit::Backspace));
+                }
+                editor.perform(Action::Edit(Edit::Paste(Arc::new(item))));
             }
             Message::TableSelected(table) => {
                 let Some(c) = self.connector() else { return Task::none() };
@@ -512,7 +574,12 @@ impl App {
                 self.tab_mut().editor.perform(Action::Edit(Edit::Paste(Arc::new(name))));
                 return Task::none();
             }
-            Message::SchemaLoaded(Ok(columns)) => self.schema = columns,
+            Message::SchemaLoaded(Ok(columns)) => {
+                if let Some(t) = &self.selected {
+                    self.columns_cache.insert(t.clone(), columns.clone());
+                }
+                self.schema = columns;
+            }
             Message::FilterChanged(filter) => self.filter = filter,
             Message::ToggleSchema(schema) => {
                 if !self.collapsed.remove(&schema) {
@@ -762,7 +829,11 @@ impl App {
                 self.manager = Some(manager);
             }
 
-            Message::Edit(action) => self.tab_mut().editor.perform(action),
+            Message::Edit(action) => {
+                let typing = matches!(action, Action::Edit(Edit::Insert(_) | Edit::Backspace));
+                self.tab_mut().editor.perform(action);
+                self.completion = if typing { self.compute_completion() } else { None };
+            }
             Message::Explain => {
                 let Some(c) = self.connector() else { return Task::none() };
                 self.persist_tabs();
@@ -1519,13 +1590,41 @@ impl App {
     fn editor_pane(&self) -> Element<'_, Message> {
         let connected = self.session.is_some();
 
+        let completing = self.completion.is_some();
         let editor = text_editor(&self.tab().editor)
             .on_action(Message::Edit)
-            .key_binding(editor_key_binding)
+            .key_binding(move |press| editor_key_binding(press, completing))
             .highlight("sql", highlighter::Theme::Base16Ocean)
             .font(MONO)
             .height(Fill)
             .padding(10);
+
+        // Liste de complétion posée sous le curseur (position approchée :
+        // police mono de 13 px, interligne 1,3).
+        let editor: Element<'_, Message> = match &self.completion {
+            Some(c) => {
+                let items = c.items.iter().enumerate().map(|(i, item)| {
+                    button(text(item).size(12).font(MONO))
+                        .on_press(Message::CompletionMove(i as i32 - c.selected as i32))
+                        .style(theme::list_item(i == c.selected))
+                        .padding([2, 8])
+                        .width(Fill)
+                        .into()
+                });
+                let list = container(Column::with_children(items).spacing(1))
+                    .style(theme::tooltip)
+                    .padding(4)
+                    .width(240);
+                let x = 10.0 + (c.column.saturating_sub(c.prefix_len)) as f32 * CHAR_WIDTH;
+                let y = 10.0 + (c.line as f32 + 1.0) * 13.0 * 1.3 + 2.0;
+                stack![
+                    editor,
+                    container(list).padding(padding::top(y).left(x)),
+                ]
+                .into()
+            }
+            None => editor.into(),
+        };
 
         let actions = row![
             button(text("Expliquer").size(13))
@@ -2084,7 +2183,19 @@ impl App {
 }
 
 /// Raccourcis de l'éditeur : ⌘↩ exécute, ⌘E explique, le reste est standard.
-fn editor_key_binding(press: KeyPress) -> Option<Binding<Message>> {
+fn editor_key_binding(press: KeyPress, completing: bool) -> Option<Binding<Message>> {
+    if completing {
+        match press.key.as_ref() {
+            Key::Named(Named::Tab) => return Some(Binding::Custom(Message::CompletionAccept)),
+            Key::Named(Named::Enter) if !press.modifiers.command() => {
+                return Some(Binding::Custom(Message::CompletionAccept));
+            }
+            Key::Named(Named::ArrowDown) => return Some(Binding::Custom(Message::CompletionMove(1))),
+            Key::Named(Named::ArrowUp) => return Some(Binding::Custom(Message::CompletionMove(-1))),
+            Key::Named(Named::Escape) => return Some(Binding::Custom(Message::CompletionClose)),
+            _ => {}
+        }
+    }
     if press.modifiers.command() {
         match press.key.as_ref() {
             Key::Named(Named::Enter) => return Some(Binding::Custom(Message::Run)),

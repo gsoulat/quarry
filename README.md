@@ -11,7 +11,9 @@ Client de bases de données léger et multiplateforme (macOS, Linux, Windows), �
 - Mots de passe stockés dans le **trousseau du système** (Keychain, Gestionnaire d'identification Windows, Secret Service), jamais en clair sur le disque
 - Tables groupées par schéma, filtre, barre latérale **redimensionnable**, bouton `+` pour **insérer le nom d'une table au curseur**
 - **Schéma** de chaque table (types, NULL, valeurs par défaut, clé primaire)
-- Éditeur SQL avec coloration, `⌘↩` exécute (la sélection seule si elle existe), `⌘E` explique
+- Éditeur SQL avec coloration et **autocomplétion** (mots-clés, tables, colonnes, `alias.` → colonnes) : `Tab`/`Entrée` accepte, `↑↓` navigue
+- Onglets de requêtes enregistrés par connexion, historique, `⌘↩` exécute (la sélection seule si elle existe), `⌘E` explique, `⌘R` actualise
+- Grilles triables (clic sur l'en-tête), filtrables, édition d'une cellule en place, **export CSV / JSON / SQL / Excel**
 - Grille de résultats paginée (200 lignes par page, 5 000 max), colonnes ajustées au contenu, **clic sur une cellule pour copier**
 - **Diagramme des tables** (onglet Diagramme) : clés étrangères dessinées sur un canvas, zoom et déplacement, boîtes déplaçables, placement automatique, trois niveaux **MPD / MLD / MCD**
 - **Mode Conception** : tables virtuelles créées sur le canvas, relations en glisser-déposer (1 → n, n → 1, n ↔ n avec table de jonction automatique), puis **génération du script** `CREATE TABLE` + `FOREIGN KEY` à exécuter sur la base connectée
