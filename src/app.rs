@@ -10,7 +10,7 @@ use iced::widget::{
     Column, Row, button, canvas, column, container, pane_grid, row, scrollable, stack, text,
     text_editor, text_input, tooltip,
 };
-use iced::{Element, Event, Fill, Font, Length, Subscription, Task, Theme, highlighter, padding};
+use iced::{Color, Element, Event, Fill, Font, Length, Subscription, Task, Theme, highlighter, padding};
 
 use crate::connector::{
     self, ColumnInfo, Connector, QueryPlan, QueryResult, Relation, Result, TableRef,
@@ -89,6 +89,8 @@ pub struct App {
     schema_row: Option<usize>,
     dialog: Option<Dialog>,
     dialog_error: Option<String>,
+    /// Menu « Édition » déroulé.
+    edit_menu: bool,
     selected: Option<TableRef>,
     schema: Vec<ColumnInfo>,
     editor: text_editor::Content,
@@ -125,7 +127,10 @@ pub enum Message {
     SchemaRowSelected(usize),
     OpenDialog(Dialog),
     Dialog(DialogMessage),
-    Executed(Refresh, Result<u64>),
+    Executed(Refresh, Option<TableRef>, Result<u64>),
+    ToggleEditMenu,
+    /// Absorbe un clic (par exemple dans le menu) sans rien faire.
+    Noop,
 
     // Diagramme
     LoadDiagram,
@@ -204,6 +209,7 @@ impl App {
             schema_row: None,
             dialog: None,
             dialog_error: None,
+            edit_menu: false,
             selected: None,
             schema: Vec::new(),
             editor: text_editor::Content::with_text("SELECT 1 AS hello"),
@@ -297,13 +303,26 @@ impl App {
                 if let Some(session) = &mut self.session {
                     session.tables = tables;
                 }
+                // Table sélectionnée encore présente : on relit son schéma
+                // (et ses lignes si l'onglet Données est ouvert).
+                let still_there = self
+                    .selected
+                    .as_ref()
+                    .is_some_and(|t| self.session.as_ref().is_some_and(|s| s.tables.contains(t)));
+                if still_there {
+                    return self.update(Message::TableSelected(self.selected.clone().unwrap()));
+                }
+                self.selected = None;
             }
             Message::TableSelected(table) => {
                 let Some(c) = self.connector() else { return Task::none() };
-                self.editor = text_editor::Content::with_text(&c.preview_sql(&table));
+                let same = self.selected.as_ref() == Some(&table);
+                if !same {
+                    self.editor = text_editor::Content::with_text(&c.preview_sql(&table));
+                }
                 self.selected = Some(table.clone());
                 self.schema_row = None;
-                if self.tab != Tab::Data {
+                if self.tab != Tab::Data && !same {
                     self.tab = Tab::Schema;
                 }
                 let describe = Task::perform(
@@ -373,9 +392,12 @@ impl App {
             Message::SchemaRowSelected(i) => {
                 self.schema_row = if self.schema_row == Some(i) { None } else { Some(i) };
             }
+            Message::ToggleEditMenu => self.edit_menu = !self.edit_menu,
+            Message::Noop => {}
             Message::OpenDialog(dialog) => {
                 self.dialog = Some(dialog);
                 self.dialog_error = None;
+                self.edit_menu = false;
             }
             Message::Dialog(DialogMessage::Cancel) => {
                 self.dialog = None;
@@ -397,12 +419,12 @@ impl App {
                 let (Some(Dialog::Confirm(pending)), Some(c)) = (&self.dialog, self.connector()) else {
                     return Task::none();
                 };
-                let (sql, refresh) = (pending.sql.clone(), pending.refresh);
+                let (sql, refresh, select) = (pending.sql.clone(), pending.refresh, pending.select.clone());
                 self.dialog = None;
                 self.status = Status::Busy("Exécution…".into());
                 return Task::perform(
                     async move { c.execute(&sql).await },
-                    move |r| Message::Executed(refresh, r),
+                    move |r| Message::Executed(refresh, select.clone(), r),
                 );
             }
             Message::Dialog(message) => {
@@ -410,14 +432,16 @@ impl App {
                     dialog.apply(message);
                 }
             }
-            Message::Executed(refresh, Ok(affected)) => {
+            Message::Executed(refresh, select, Ok(affected)) => {
                 self.status = Status::Info(format!("Exécuté · {affected} ligne(s) touchée(s)"));
                 let Some(c) = self.connector() else { return Task::none() };
                 return match refresh {
                     Refresh::Data => self.update(Message::LoadData),
                     Refresh::Structure => {
-                        // La table sélectionnée a pu changer de nom ou disparaître.
-                        self.selected = None;
+                        // On recharge la liste, puis le schéma de la table
+                        // concernée (créée, modifiée ou renommée) ; `TablesLoaded`
+                        // s'en charge d'après `selected`.
+                        self.selected = select;
                         self.schema.clear();
                         self.schema_row = None;
                         self.data = None;
@@ -427,7 +451,7 @@ impl App {
                     }
                 };
             }
-            Message::Executed(_, Err(e)) => self.status = Status::Error(e),
+            Message::Executed(_, _, Err(e)) => self.status = Status::Error(e),
 
             Message::LoadDiagram => {
                 let Some(session) = &self.session else { return Task::none() };
@@ -694,12 +718,18 @@ impl App {
         .height(Fill);
 
         let base = column![self.top_bar(), panes, self.status_bar()].spacing(10).padding(12);
+        let base: Element<'_, Message> = if self.edit_menu && self.session.is_some() {
+            stack![base, self.edit_menu()].into()
+        } else {
+            base.into()
+        };
 
         if let Some(m) = &self.manager {
             return stack![base, manager::view(m, &self.connections)].into();
         }
+        let engine = self.active_config().map_or(Engine::Postgres, |c| c.engine);
         match &self.dialog {
-            Some(d) => stack![base, editing::view(d, self.dialog_error.as_deref())].into(),
+            Some(d) => stack![base, editing::view(d, self.dialog_error.as_deref(), engine)].into(),
             None => base.into(),
         }
     }
@@ -722,9 +752,15 @@ impl App {
             .style(theme::outline(theme::DANGER))
             .padding([5, 12]);
 
+        let edit = button(text(if self.edit_menu { "Édition ▴" } else { "Édition ▾" }).size(13))
+            .on_press_maybe(self.session.as_ref().map(|_| Message::ToggleEditMenu))
+            .style(theme::outline(theme::PRIMARY))
+            .padding([5, 12]);
+
         row![
             text("Quarry").size(20).color(theme::PRIMARY),
             container(active).width(Fill),
+            edit,
             disconnect,
         ]
         .spacing(16)
@@ -909,10 +945,9 @@ impl App {
             tree = tree.push(text("Aucune table").size(12).color(theme::MUTED));
         }
 
-        let default_schema = session.tables.iter().find_map(|t| t.schema.as_deref()).map(str::to_owned);
         tree = tree.push(
             button(text("+ Nouvelle table").size(12))
-                .on_press(Message::OpenDialog(Dialog::Table(TableForm::new(default_schema.as_deref()))))
+                .on_press_maybe(self.dialog_new_table().map(Message::OpenDialog))
                 .style(theme::list_item(false))
                 .padding([3, 6])
                 .width(Fill),
@@ -1059,6 +1094,148 @@ impl App {
         column![header, grid].spacing(6).into()
     }
 
+    // ------------------------------------------------------------------
+    // Actions d'édition, partagées par le menu « Édition » et les onglets.
+    // `None` : l'action ne s'applique pas dans l'état courant.
+    // ------------------------------------------------------------------
+
+    fn dialog_new_table(&self) -> Option<Dialog> {
+        let session = self.session.as_ref()?;
+        let config = self.active_config()?;
+        let schema = session.tables.iter().find_map(|t| t.schema.as_deref());
+        Some(Dialog::Table(TableForm::new(schema, config.engine)))
+    }
+
+    fn dialog_rename_table(&self) -> Option<Dialog> {
+        let table = self.selected.clone()?;
+        Some(Dialog::Rename(RenameForm { table, column: None, to: String::new() }))
+    }
+
+    fn dialog_drop_table(&self) -> Option<Dialog> {
+        let (table, c) = (self.selected.as_ref()?, self.connector()?);
+        Some(Dialog::Confirm(editing::Pending {
+            title: format!("Supprimer la table {table}"),
+            sql: c.drop_table_sql(table),
+            refresh: Refresh::Structure,
+            select: None,
+        }))
+    }
+
+    fn dialog_add_column(&self) -> Option<Dialog> {
+        let table = self.selected.clone()?;
+        Some(Dialog::Column(editing::ColumnForm { table, draft: editing::ColumnDraft::new() }))
+    }
+
+    fn selected_column(&self) -> Option<String> {
+        self.schema_row.and_then(|i| self.schema.get(i)).map(|c| c.name.clone())
+    }
+
+    fn dialog_rename_column(&self) -> Option<Dialog> {
+        let (table, column) = (self.selected.clone()?, self.selected_column()?);
+        Some(Dialog::Rename(RenameForm { table, column: Some(column), to: String::new() }))
+    }
+
+    fn dialog_drop_column(&self) -> Option<Dialog> {
+        let (table, column, c) = (self.selected.as_ref()?, self.selected_column()?, self.connector()?);
+        Some(Dialog::Confirm(editing::Pending {
+            title: format!("Supprimer la colonne {column}"),
+            sql: c.alter_table_sql(table, &connector::Alter::DropColumn(column)),
+            refresh: Refresh::Structure,
+            select: Some(table.clone()),
+        }))
+    }
+
+    fn selected_data_row(&self) -> Option<&Vec<connector::Cell>> {
+        let data = self.data.as_ref().filter(|_| self.data_table == self.selected)?;
+        data.rows.get(self.data_row?)
+    }
+
+    fn dialog_insert_row(&self) -> Option<Dialog> {
+        let table = self.selected.clone()?;
+        if self.schema.is_empty() {
+            return None;
+        }
+        Some(Dialog::Row(RowForm::insert(table, self.schema.clone())))
+    }
+
+    fn dialog_update_row(&self) -> Option<Dialog> {
+        let (table, row) = (self.selected.clone()?, self.selected_data_row()?);
+        if !self.schema.iter().any(|c| c.primary_key) {
+            return None;
+        }
+        Some(Dialog::Row(RowForm::update(table, self.schema.clone(), row)))
+    }
+
+    fn dialog_delete_row(&self) -> Option<Dialog> {
+        let (table, row, c) = (self.selected.as_ref()?, self.selected_data_row()?, self.connector()?);
+        let key: Vec<_> = self
+            .schema
+            .iter()
+            .enumerate()
+            .filter(|(_, col)| col.primary_key)
+            .filter_map(|(i, col)| Some((col.name.clone(), row.get(i)?.clone())))
+            .collect();
+        if key.is_empty() {
+            return None;
+        }
+        Some(Dialog::Confirm(editing::Pending {
+            title: format!("Supprimer une ligne de {table}"),
+            sql: c.delete_sql(table, &key),
+            refresh: Refresh::Data,
+            select: Some(table.clone()),
+        }))
+    }
+
+    /// Menu « Édition » déroulé sous le bouton de la barre du haut.
+    fn edit_menu(&self) -> Element<'_, Message> {
+        let item = |label: &'static str, dialog: Option<Dialog>, danger: bool| {
+            let color = match (dialog.is_some(), danger) {
+                (false, _) => Color { a: 0.4, ..theme::MUTED },
+                (true, true) => theme::DANGER,
+                (true, false) => theme::TEXT,
+            };
+            button(text(label).size(13).color(color))
+                .on_press_maybe(dialog.map(Message::OpenDialog))
+                .style(theme::list_item(false))
+                .padding([5, 12])
+                .width(Fill)
+        };
+        let section = |label: &'static str| {
+            container(text(label).size(11).color(theme::MUTED)).padding(padding::top(8).bottom(2).left(12))
+        };
+        let table_name = self.selected.as_ref().map_or("aucune table sélectionnée".to_string(), |t| t.to_string());
+
+        let menu = column![
+            container(text(table_name).size(12).color(theme::PRIMARY)).padding([6, 12]),
+            section("TABLE"),
+            item("Nouvelle table…", self.dialog_new_table(), false),
+            item("Renommer la table…", self.dialog_rename_table(), false),
+            item("Supprimer la table…", self.dialog_drop_table(), true),
+            section("COLONNES"),
+            item("Ajouter une colonne…", self.dialog_add_column(), false),
+            item("Renommer la colonne sélectionnée…", self.dialog_rename_column(), false),
+            item("Supprimer la colonne sélectionnée…", self.dialog_drop_column(), true),
+            section("LIGNES"),
+            item("Ajouter une ligne…", self.dialog_insert_row(), false),
+            item("Modifier la ligne sélectionnée…", self.dialog_update_row(), false),
+            item("Supprimer la ligne sélectionnée…", self.dialog_delete_row(), true),
+        ]
+        .width(320);
+
+        let panel = container(menu).style(theme::panel).padding(6);
+
+        // Un clic hors du menu le referme ; dans le menu, il est absorbé.
+        iced::widget::mouse_area(
+            container(iced::widget::mouse_area(panel).on_press(Message::Noop))
+            .align_right(Fill)
+            .padding(padding::top(52).right(12))
+            .width(Fill)
+            .height(Fill),
+        )
+        .on_press(Message::ToggleEditMenu)
+        .into()
+    }
+
     fn schema_view(&self) -> Element<'_, Message> {
         let Some(table) = &self.selected else {
             return hint("Sélectionne une table dans la liste pour voir son schéma.");
@@ -1074,48 +1251,13 @@ impl App {
             ]
         });
 
-        let column = self.schema_row.and_then(|i| self.schema.get(i)).map(|c| c.name.clone());
-        let action = |label: &'static str, dialog: Option<Dialog>, danger: bool| {
-            let b = button(text(label).size(12)).on_press_maybe(dialog.map(Message::OpenDialog)).padding([3, 10]);
-            if danger { b.style(theme::outline(theme::DANGER)) } else { b.style(button::secondary) }
-        };
-        let drop_column = column.as_ref().and_then(|name| {
-            let c = self.connector()?;
-            Some(Dialog::Confirm(editing::Pending {
-                title: format!("Supprimer la colonne {name}"),
-                sql: c.alter_table_sql(table, &connector::Alter::DropColumn(name.clone())),
-                refresh: Refresh::Structure,
-            }))
-        });
-        let drop_table = self.connector().map(|c| {
-            Dialog::Confirm(editing::Pending {
-                title: format!("Supprimer la table {table}"),
-                sql: c.drop_table_sql(table),
-                refresh: Refresh::Structure,
-            })
-        });
         let toolbar = row![
             text(table.to_string()).size(15).color(theme::PRIMARY).width(Fill),
-            action(
-                "+ Colonne",
-                Some(Dialog::Column(editing::ColumnForm {
-                    table: table.clone(),
-                    draft: editing::ColumnDraft { name: String::new(), data_type: String::new(), nullable: true, primary_key: false },
-                })),
-                false,
-            ),
-            action(
-                "Renommer la colonne",
-                column.clone().map(|c| Dialog::Rename(RenameForm { table: table.clone(), column: Some(c), to: String::new() })),
-                false,
-            ),
-            action("Supprimer la colonne", drop_column, true),
-            action(
-                "Renommer la table",
-                Some(Dialog::Rename(RenameForm { table: table.clone(), column: None, to: String::new() })),
-                false,
-            ),
-            action("Supprimer la table", drop_table, true),
+            action_button("+ Colonne", self.dialog_add_column(), false),
+            action_button("Renommer la colonne", self.dialog_rename_column(), false),
+            action_button("Supprimer la colonne", self.dialog_drop_column(), true),
+            action_button("Renommer la table", self.dialog_rename_table(), false),
+            action_button("Supprimer la table", self.dialog_drop_table(), true),
         ]
         .spacing(6)
         .align_y(iced::Center);
@@ -1138,37 +1280,12 @@ impl App {
         };
 
         let has_pk = self.schema.iter().any(|c| c.primary_key);
-        let selected_row = self.data_row.and_then(|i| data.rows.get(i));
-        let columns = self.schema.clone();
 
-        let insert = Dialog::Row(RowForm::insert(table.clone(), columns.clone()));
-        let update = selected_row
-            .filter(|_| has_pk)
-            .map(|row| Dialog::Row(RowForm::update(table.clone(), columns.clone(), row)));
-        let delete = selected_row.filter(|_| has_pk).and_then(|row| {
-            let c = self.connector()?;
-            let key: Vec<_> = columns
-                .iter()
-                .enumerate()
-                .filter(|(_, col)| col.primary_key)
-                .filter_map(|(i, col)| Some((col.name.clone(), row.get(i)?.clone())))
-                .collect();
-            Some(Dialog::Confirm(editing::Pending {
-                title: format!("Supprimer une ligne de {table}"),
-                sql: c.delete_sql(table, &key),
-                refresh: Refresh::Data,
-            }))
-        });
-
-        let action = |label: &'static str, dialog: Option<Dialog>, danger: bool| {
-            let b = button(text(label).size(12)).on_press_maybe(dialog.map(Message::OpenDialog)).padding([3, 10]);
-            if danger { b.style(theme::outline(theme::DANGER)) } else { b.style(button::secondary) }
-        };
         let toolbar = row![
             text(table.to_string()).size(15).color(theme::PRIMARY).width(Fill),
-            action("+ Ligne", Some(insert), false),
-            action("Modifier", update, false),
-            action("Supprimer", delete, true),
+            action_button("+ Ligne", self.dialog_insert_row(), false),
+            action_button("Modifier", self.dialog_update_row(), false),
+            action_button("Supprimer", self.dialog_delete_row(), true),
             button(text("Rafraîchir").size(12)).on_press(Message::LoadData).style(button::secondary).padding([3, 10]),
         ]
         .spacing(6)
@@ -1324,6 +1441,12 @@ fn source_line(sql: Option<&str>) -> Element<'_, Message> {
         .color(theme::MUTED)
         .wrapping(text::Wrapping::None)
         .into()
+}
+
+/// Bouton d'action d'un onglet : grisé quand l'action ne s'applique pas.
+fn action_button<'a>(label: &'static str, dialog: Option<Dialog>, danger: bool) -> Element<'a, Message> {
+    let b = button(text(label).size(12)).on_press_maybe(dialog.map(Message::OpenDialog)).padding([3, 10]);
+    if danger { b.style(theme::outline(theme::DANGER)).into() } else { b.style(button::secondary).into() }
 }
 
 fn hint(message: &str) -> Element<'_, Message> {

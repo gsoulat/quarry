@@ -8,11 +8,38 @@ use iced::widget::{
 };
 use iced::{Background, Color, Element, Fill, Font};
 
+use iced::widget::pick_list;
+
 use crate::app::Message;
 use crate::connector::{Alter, Cell, ColumnDef, ColumnInfo, Connector, Input, TableRef};
+use crate::store::Engine;
 use crate::theme;
 
 const MONO: Font = Font::MONOSPACE;
+/// Entrée du menu des types qui rend la saisie libre.
+const CUSTOM_TYPE: &str = "Personnalisé…";
+
+/// Types proposés dans le menu déroulant, par moteur. Les plus courants
+/// d'abord ; « Personnalisé… » couvre le reste (VARCHAR(100), NUMERIC(10,2)…).
+pub fn type_options(engine: Engine) -> &'static [&'static str] {
+    match engine {
+        Engine::Postgres => &[
+            "INTEGER", "BIGINT", "SMALLINT", "SERIAL", "BIGSERIAL", "NUMERIC", "REAL",
+            "DOUBLE PRECISION", "BOOLEAN", "TEXT", "VARCHAR(255)", "UUID", "DATE", "TIME",
+            "TIMESTAMP", "TIMESTAMPTZ", "JSON", "JSONB", "BYTEA",
+        ],
+        Engine::MySql => &[
+            "INT", "BIGINT", "SMALLINT", "TINYINT", "DECIMAL(10,2)", "FLOAT", "DOUBLE", "BOOLEAN",
+            "VARCHAR(255)", "TEXT", "CHAR(36)", "DATE", "TIME", "DATETIME", "TIMESTAMP", "JSON",
+            "BLOB",
+        ],
+        Engine::Sqlite => &["INTEGER", "REAL", "TEXT", "BLOB", "NUMERIC"],
+        Engine::BigQuery => &[
+            "INT64", "FLOAT64", "NUMERIC", "BOOL", "STRING", "BYTES", "DATE", "TIME", "DATETIME",
+            "TIMESTAMP", "JSON",
+        ],
+    }
+}
 
 /// Ce qu'il faut recharger une fois le SQL exécuté.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +55,8 @@ pub struct Pending {
     pub title: String,
     pub sql: String,
     pub refresh: Refresh,
+    /// Table à sélectionner une fois le SQL exécuté (créée, renommée…).
+    pub select: Option<TableRef>,
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +134,7 @@ impl RowForm {
                     title: format!("Insérer une ligne dans {}", self.table),
                     sql: c.insert_sql(&self.table, &values),
                     refresh: Refresh::Data,
+                    select: Some(self.table.clone()),
                 })
             }
             Some(original) => {
@@ -132,6 +162,7 @@ impl RowForm {
                     title: format!("Modifier une ligne de {}", self.table),
                     sql: c.update_sql(&self.table, &changed, &key),
                     refresh: Refresh::Data,
+                    select: Some(self.table.clone()),
                 })
             }
         }
@@ -144,11 +175,13 @@ pub struct ColumnDraft {
     pub data_type: String,
     pub nullable: bool,
     pub primary_key: bool,
+    /// Type saisi librement plutôt que choisi dans le menu.
+    pub custom_type: bool,
 }
 
 impl ColumnDraft {
-    fn new() -> Self {
-        Self { name: String::new(), data_type: String::new(), nullable: true, primary_key: false }
+    pub fn new() -> Self {
+        Self { name: String::new(), data_type: String::new(), nullable: true, primary_key: false, custom_type: false }
     }
 
     fn to_def(&self) -> Result<ColumnDef, String> {
@@ -176,13 +209,15 @@ pub struct TableForm {
 }
 
 impl TableForm {
-    pub fn new(schema: Option<&str>) -> Self {
-        let id = ColumnDraft {
-            name: "id".into(),
-            data_type: "INTEGER".into(),
-            nullable: false,
-            primary_key: true,
+    pub fn new(schema: Option<&str>, engine: Engine) -> Self {
+        let id_type = match engine {
+            Engine::Postgres => "SERIAL",
+            Engine::MySql => "INT",
+            Engine::Sqlite => "INTEGER",
+            Engine::BigQuery => "INT64",
         };
+        let id = ColumnDraft { name: "id".into(), data_type: id_type.into(), ..ColumnDraft::new() };
+        let id = ColumnDraft { nullable: false, primary_key: true, ..id };
         Self { schema: schema.unwrap_or_default().into(), name: String::new(), columns: vec![id, ColumnDraft::new()] }
     }
 
@@ -207,6 +242,7 @@ impl TableForm {
             title: format!("Créer la table {table}"),
             sql: c.create_table_sql(&table, &columns),
             refresh: Refresh::Structure,
+            select: Some(table),
         })
     }
 }
@@ -225,6 +261,7 @@ impl ColumnForm {
             title: format!("Ajouter une colonne à {}", self.table),
             sql: c.alter_table_sql(&self.table, &Alter::AddColumn(def)),
             refresh: Refresh::Structure,
+            select: Some(self.table.clone()),
         })
     }
 }
@@ -244,14 +281,24 @@ impl RenameForm {
         if to.is_empty() {
             return Err("Nouveau nom manquant".into());
         }
-        let (title, alter) = match &self.column {
+        let (title, alter, select) = match &self.column {
             Some(column) => (
                 format!("Renommer la colonne {column}"),
                 Alter::RenameColumn { from: column.clone(), to: to.into() },
+                self.table.clone(),
             ),
-            None => (format!("Renommer la table {}", self.table), Alter::RenameTable(to.into())),
+            None => (
+                format!("Renommer la table {}", self.table),
+                Alter::RenameTable(to.into()),
+                TableRef { schema: self.table.schema.clone(), name: to.into() },
+            ),
         };
-        Ok(Pending { title, sql: c.alter_table_sql(&self.table, &alter), refresh: Refresh::Structure })
+        Ok(Pending {
+            title,
+            sql: c.alter_table_sql(&self.table, &alter),
+            refresh: Refresh::Structure,
+            select: Some(select),
+        })
     }
 }
 
@@ -275,6 +322,8 @@ pub enum DialogMessage {
     ColumnType(usize, String),
     ColumnNullable(usize, bool),
     ColumnPrimary(usize, bool),
+    /// Bascule entre le menu de types et la saisie libre.
+    ColumnCustomType(usize),
     AddColumnRow,
     RemoveColumnRow(usize),
     RenameTo(String),
@@ -306,6 +355,8 @@ impl Dialog {
             (Dialog::Table(f), M::ColumnType(i, v)) => set_column(&mut f.columns, i, |c| c.data_type = v),
             (Dialog::Table(f), M::ColumnNullable(i, v)) => set_column(&mut f.columns, i, |c| c.nullable = v),
             (Dialog::Table(f), M::ColumnPrimary(i, v)) => set_column(&mut f.columns, i, |c| c.primary_key = v),
+            (Dialog::Table(f), M::ColumnCustomType(i)) => set_column(&mut f.columns, i, |c| c.custom_type = !c.custom_type),
+            (Dialog::Column(f), M::ColumnCustomType(_)) => f.draft.custom_type = !f.draft.custom_type,
             (Dialog::Table(f), M::AddColumnRow) => f.columns.push(ColumnDraft::new()),
             (Dialog::Table(f), M::RemoveColumnRow(i)) => {
                 if i < f.columns.len() && f.columns.len() > 1 {
@@ -341,7 +392,7 @@ fn set_column(columns: &mut [ColumnDraft], i: usize, f: impl FnOnce(&mut ColumnD
 // Vues
 // ----------------------------------------------------------------------
 
-pub fn view<'a>(dialog: &'a Dialog, error: Option<&'a str>) -> Element<'a, Message> {
+pub fn view<'a>(dialog: &'a Dialog, error: Option<&'a str>, engine: Engine) -> Element<'a, Message> {
     let (title, body, submit_label): (String, Element<'a, Message>, &str) = match dialog {
         Dialog::Row(f) => (
             match &f.original {
@@ -351,8 +402,8 @@ pub fn view<'a>(dialog: &'a Dialog, error: Option<&'a str>) -> Element<'a, Messa
             row_form(f),
             "Voir le SQL",
         ),
-        Dialog::Table(f) => ("Nouvelle table".into(), table_form(f), "Voir le SQL"),
-        Dialog::Column(f) => (format!("Ajouter une colonne à {}", f.table), column_form(f), "Voir le SQL"),
+        Dialog::Table(f) => ("Nouvelle table".into(), table_form(f, engine), "Voir le SQL"),
+        Dialog::Column(f) => (format!("Ajouter une colonne à {}", f.table), column_form(f, engine), "Voir le SQL"),
         Dialog::Rename(f) => (
             match &f.column {
                 Some(c) => format!("Renommer la colonne {c}"),
@@ -446,7 +497,50 @@ fn row_form(f: &RowForm) -> Element<'_, Message> {
     .into()
 }
 
-fn column_rows<'a>(columns: &'a [ColumnDraft], removable: bool) -> Element<'a, Message> {
+/// Menu des types, ou champ libre si la colonne est en mode personnalisé.
+fn type_picker<'a>(i: usize, c: &'a ColumnDraft, engine: Engine) -> Element<'a, Message> {
+    if c.custom_type {
+        return row![
+            text_input("VARCHAR(100), NUMERIC(10,2)…", &c.data_type)
+                .on_input(move |v| Message::Dialog(DialogMessage::ColumnType(i, v)))
+                .font(MONO)
+                .size(13)
+                .padding(6)
+                .width(Fill),
+            button(text("Menu").size(11))
+                .on_press(Message::Dialog(DialogMessage::ColumnCustomType(i)))
+                .style(button::text)
+                .padding([4, 6]),
+        ]
+        .spacing(4)
+        .align_y(iced::Center)
+        .into();
+    }
+
+    let mut options: Vec<String> = type_options(engine).iter().map(|t| t.to_string()).collect();
+    // Un type venu d'ailleurs (table existante, saisie libre) reste sélectionnable.
+    if !c.data_type.is_empty() && !options.contains(&c.data_type) {
+        options.insert(0, c.data_type.clone());
+    }
+    options.push(CUSTOM_TYPE.into());
+    let selected = (!c.data_type.is_empty()).then(|| c.data_type.clone());
+
+    pick_list(options, selected, move |choice: String| {
+        if choice == CUSTOM_TYPE {
+            Message::Dialog(DialogMessage::ColumnCustomType(i))
+        } else {
+            Message::Dialog(DialogMessage::ColumnType(i, choice))
+        }
+    })
+    .placeholder("Type")
+    .font(MONO)
+    .text_size(13)
+    .padding(6)
+    .width(Fill)
+    .into()
+}
+
+fn column_rows<'a>(columns: &'a [ColumnDraft], removable: bool, engine: Engine) -> Element<'a, Message> {
     let header = row![
         container(label("Nom")).width(Fill),
         container(label("Type")).width(Fill),
@@ -463,12 +557,7 @@ fn column_rows<'a>(columns: &'a [ColumnDraft], removable: bool) -> Element<'a, M
                 .size(13)
                 .padding(6)
                 .width(Fill),
-            text_input("INTEGER, TEXT, VARCHAR(255)…", &c.data_type)
-                .on_input(move |v| Message::Dialog(DialogMessage::ColumnType(i, v)))
-                .font(MONO)
-                .size(13)
-                .padding(6)
-                .width(Fill),
+            container(type_picker(i, c, engine)).width(Fill),
             container(
                 checkbox(c.nullable && !c.primary_key)
                     .on_toggle(move |v| Message::Dialog(DialogMessage::ColumnNullable(i, v)))
@@ -495,7 +584,7 @@ fn column_rows<'a>(columns: &'a [ColumnDraft], removable: bool) -> Element<'a, M
     column![header, Column::with_children(rows).spacing(6)].spacing(6).into()
 }
 
-fn table_form(f: &TableForm) -> Element<'_, Message> {
+fn table_form(f: &TableForm, engine: Engine) -> Element<'_, Message> {
     column![
         row![
             column![
@@ -520,8 +609,8 @@ fn table_form(f: &TableForm) -> Element<'_, Message> {
             .width(Fill),
         ]
         .spacing(12),
-        label("Colonnes — les types sont ceux du moteur (INTEGER, TEXT, VARCHAR(255), TIMESTAMP, UUID…)."),
-        column_rows(&f.columns, true),
+        label("Colonnes — choisis le type dans le menu, ou « Personnalisé… » pour le saisir."),
+        column_rows(&f.columns, true, engine),
         button(text("+ Colonne").size(13))
             .on_press(Message::Dialog(DialogMessage::AddColumnRow))
             .style(button::secondary)
@@ -531,10 +620,10 @@ fn table_form(f: &TableForm) -> Element<'_, Message> {
     .into()
 }
 
-fn column_form(f: &ColumnForm) -> Element<'_, Message> {
+fn column_form(f: &ColumnForm, engine: Engine) -> Element<'_, Message> {
     column![
         label("Une nouvelle colonne doit accepter NULL ou avoir une valeur par défaut si la table contient déjà des lignes."),
-        column_rows(std::slice::from_ref(&f.draft), false),
+        column_rows(std::slice::from_ref(&f.draft), false, engine),
     ]
     .spacing(12)
     .into()

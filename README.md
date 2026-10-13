@@ -6,7 +6,7 @@ Client de bases de données léger et multiplateforme (macOS, Linux, Windows), �
 
 - **PostgreSQL**, **MySQL**, **SQLite** et **Google BigQuery**
 - **Gestionnaire de connexions** (bouton « Gérer ») : ajouter, tester, modifier, supprimer, ranger dans des **dossiers**
-- **Édition par l'interface** : créer / renommer / supprimer une table, ajouter / renommer / supprimer une colonne, insérer / modifier / supprimer une ligne (onglet Données). Le SQL généré est **affiché et confirmé avant exécution**
+- **Menu « Édition »** : créer / renommer / supprimer une table, ajouter / renommer / supprimer une colonne (types dans un menu déroulant par moteur), insérer / modifier / supprimer une ligne (onglet Données). Le SQL généré est **affiché et confirmé avant exécution**
 - Barre latérale groupée en **Local / Distant / Cloud** : un clic pour se (re)connecter
 - Mots de passe stockés dans le **trousseau du système** (Keychain, Gestionnaire d'identification Windows, Secret Service), jamais en clair sur le disque
 - Tables groupées par schéma, filtre, barre latérale **redimensionnable**, bouton `+` pour **insérer le nom d'une table au curseur**
