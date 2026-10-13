@@ -130,9 +130,14 @@ row_decoder!(decode_mysql, MySqlRow, unchecked_text: true);
 row_decoder!(decode_sqlite, SqliteRow, unchecked_text: false);
 
 /// Lit au plus `MAX_ROWS` lignes et les convertit en [`QueryResult`].
+///
+/// `persistent(false)` : pas de requête préparée mise en cache. Le SQL vient
+/// de l'utilisateur et change sans cesse, et surtout PostgreSQL refuse un
+/// plan en cache dont les colonnes ont changé après un `ALTER TABLE`
+/// (« cached plan must not change result type »).
 macro_rules! run_query {
     ($pool:expr, $sql:expr, $decode:ident) => {{
-        let mut stream = sqlx::query(AssertSqlSafe($sql.to_owned())).fetch($pool);
+        let mut stream = sqlx::query(AssertSqlSafe($sql.to_owned())).persistent(false).fetch($pool);
         let mut result = QueryResult::default();
         while let Some(row) = stream.try_next().await.map_err(err)? {
             if result.columns.is_empty() {
@@ -412,6 +417,7 @@ impl Connector for SqlConnector {
             Self::Postgres(pool) => {
                 let (json,): (JsonValue,) =
                     sqlx::query_as(AssertSqlSafe(format!("EXPLAIN (FORMAT JSON) {sql}")))
+                        .persistent(false)
                         .fetch_one(pool)
                         .await
                         .map_err(err)?;
@@ -420,6 +426,7 @@ impl Connector for SqlConnector {
             Self::MySql(pool) => {
                 let (tree,): (String,) =
                     sqlx::query_as(AssertSqlSafe(format!("EXPLAIN FORMAT=TREE {sql}")))
+                        .persistent(false)
                         .fetch_one(pool)
                         .await
                         .map_err(|e| {
@@ -430,6 +437,7 @@ impl Connector for SqlConnector {
             Self::Sqlite(pool) => {
                 let rows: Vec<(i64, i64, i64, String)> =
                     sqlx::query_as(AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
+                        .persistent(false)
                         .fetch_all(pool)
                         .await
                         .map_err(err)?;
@@ -450,9 +458,9 @@ impl Connector for SqlConnector {
     async fn execute(&self, sql: &str) -> Result<u64> {
         let sql = AssertSqlSafe(sql.to_owned());
         let affected = match self {
-            Self::Postgres(pool) => sqlx::query(sql).execute(pool).await.map_err(err)?.rows_affected(),
-            Self::MySql(pool) => sqlx::query(sql).execute(pool).await.map_err(err)?.rows_affected(),
-            Self::Sqlite(pool) => sqlx::query(sql).execute(pool).await.map_err(err)?.rows_affected(),
+            Self::Postgres(pool) => sqlx::query(sql).persistent(false).execute(pool).await.map_err(err)?.rows_affected(),
+            Self::MySql(pool) => sqlx::query(sql).persistent(false).execute(pool).await.map_err(err)?.rows_affected(),
+            Self::Sqlite(pool) => sqlx::query(sql).persistent(false).execute(pool).await.map_err(err)?.rows_affected(),
         };
         Ok(affected)
     }
