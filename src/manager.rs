@@ -224,8 +224,8 @@ pub fn view<'a>(manager: &'a Manager, connections: &'a [ConnectionConfig]) -> El
     let dialog = container(content)
         .style(theme::panel)
         .padding(20)
-        .width(860)
-        .height(560);
+        .width(880)
+        .height(660);
 
     // Fond assombri. La fenêtre se ferme par Échap ou par le bouton,
     // jamais par un clic à côté : on ne perd pas ce qu'on a saisi.
@@ -363,12 +363,13 @@ fn form_view(manager: &Manager) -> Element<'_, Message> {
         );
     }
 
+    // Les champs défilent si la fenêtre est trop basse ; les boutons restent visibles.
     column![
-        fields,
-        container(feedback.size(13).font(Font::MONOSPACE)).height(Fill),
+        scrollable(fields).height(Fill),
+        feedback.size(13).font(Font::MONOSPACE),
         actions,
     ]
-    .spacing(16)
+    .spacing(14)
     .width(Fill)
     .into()
 }

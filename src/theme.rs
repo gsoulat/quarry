@@ -123,6 +123,49 @@ pub fn tooltip(_theme: &Theme) -> container::Style {
     }
 }
 
+/// Barre du haut : un bandeau de surface avec un filet en bas.
+pub fn top_bar(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(SURFACE)),
+        border: Border { color: BORDER, width: 1.0, radius: RADIUS.into() },
+        ..container::Style::default()
+    }
+}
+
+/// Onglet de la zone de résultats : texte en couleur et fond léger quand actif.
+pub fn tab(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        let hovered = matches!(status, button::Status::Hovered);
+        button::Style {
+            background: if active {
+                Some(Background::Color(Color { a: 0.18, ..PRIMARY }))
+            } else if hovered {
+                Some(Background::Color(SURFACE_ALT))
+            } else {
+                None
+            },
+            text_color: if active { PRIMARY } else { MUTED },
+            border: Border { radius: 6.0.into(), ..Border::default() },
+            ..button::Style::default()
+        }
+    }
+}
+
+/// Bouton principal : plein, arrondi.
+pub fn primary(_theme: &Theme, status: button::Status) -> button::Style {
+    let base = match status {
+        button::Status::Hovered | button::Status::Pressed => color!(0x8fb3ff),
+        button::Status::Disabled => Color { a: 0.35, ..PRIMARY },
+        button::Status::Active => PRIMARY,
+    };
+    button::Style {
+        background: Some(Background::Color(base)),
+        text_color: BACKGROUND,
+        border: Border { radius: 6.0.into(), ..Border::default() },
+        ..button::Style::default()
+    }
+}
+
 /// Onglet ou entrée de liste : discret, mis en avant quand il est actif.
 pub fn list_item(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |_theme, status| {

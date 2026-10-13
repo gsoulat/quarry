@@ -1372,7 +1372,7 @@ impl App {
     fn top_bar(&self) -> Element<'_, Message> {
         let active: Element<'_, Message> = match self.active_config() {
             Some(c) => row![
-                text("●").size(10).color(theme::SUCCESS),
+                text("●").size(13).color(theme::SUCCESS),
                 text(&c.name).size(15).color(theme::TEXT),
                 text(c.summary()).size(12).font(MONO).color(theme::MUTED),
             ]
@@ -1392,14 +1392,19 @@ impl App {
             .style(theme::outline(theme::PRIMARY))
             .padding([5, 12]);
 
-        row![
-            text("Quarry").size(20).color(theme::PRIMARY),
-            container(active).width(Fill),
-            edit,
-            disconnect,
-        ]
-        .spacing(16)
-        .align_y(iced::Center)
+        container(
+            row![
+                text("Quarry").size(20).color(theme::PRIMARY),
+                container(active).width(Fill),
+                edit,
+                disconnect,
+            ]
+            .spacing(16)
+            .align_y(iced::Center),
+        )
+        .style(theme::top_bar)
+        .padding([8, 14])
+        .width(Fill)
         .into()
     }
 
@@ -1521,15 +1526,17 @@ impl App {
             text("●").color(theme::WARNING)
         } else {
             text("○").color(theme::MUTED)
-        };
+        }
+        .size(13);
 
         let folded = self.folded.contains(&config.id);
         let entry = button(
             row![
                 text(if session.is_none() { " " } else if folded { "▸" } else { "▾" })
-                    .size(12)
-                    .color(theme::MUTED),
-                marker.size(10),
+                    .size(14)
+                    .color(theme::MUTED)
+                    .width(12),
+                marker,
                 column![
                     text(&config.name).size(13).wrapping(text::Wrapping::None),
                     text(format!("{} · {}", config.engine, config.summary()))
@@ -1625,10 +1632,11 @@ impl App {
             .gap(8);
 
         let insert = tooltip(
-            button(text("+").size(12))
+            button(container(text("+").size(13)).center_x(Fill))
                 .on_press(Message::InsertTable(table.clone()))
                 .style(theme::list_item(false))
-                .padding([3, 7]),
+                .padding([2, 0])
+                .width(24),
             text("Insérer dans l'éditeur").size(12),
             tooltip::Position::Right,
         )
@@ -1637,8 +1645,9 @@ impl App {
         .gap(8);
 
         row![name, insert]
-            .spacing(2)
+            .spacing(4)
             .align_y(iced::Center)
+            .width(Fill)
             .padding(padding::left(if indent { 10.0 } else { 0.0 }))
             .into()
     }
@@ -1729,6 +1738,7 @@ impl App {
                 .padding([6, 14]),
             button(text("Exécuter  ⌘↩").size(13))
                 .on_press_maybe(connected.then_some(Message::Run))
+                .style(theme::primary)
                 .padding([6, 14]),
             text("La sélection seule est exécutée si elle existe.")
                 .size(12)
@@ -1750,18 +1760,27 @@ impl App {
         let tab = |label, tab| {
             button(text(label).size(13))
                 .on_press(Message::TabSelected(tab))
-                .style(theme::list_item(self.tab == tab))
-                .padding([4, 12])
+                .style(theme::tab(self.tab == tab))
+                .padding([5, 14])
         };
-        let tabs = row![
-            tab("Résultats", Tab::Results),
-            tab("Données", Tab::Data),
-            tab("Schéma", Tab::Schema),
-            tab("Plan d'exécution", Tab::Plan),
-            tab("Diagramme", Tab::Diagram),
-            tab("Historique", Tab::History),
+        let tabs = column![
+            row![
+                tab("Résultats", Tab::Results),
+                tab("Données", Tab::Data),
+                tab("Schéma", Tab::Schema),
+                tab("Plan d'exécution", Tab::Plan),
+                tab("Diagramme", Tab::Diagram),
+                tab("Historique", Tab::History),
+            ]
+            .spacing(2),
+            iced::widget::rule::horizontal(1).style(|_: &Theme| iced::widget::rule::Style {
+                color: theme::BORDER,
+                radius: 0.0.into(),
+                fill_mode: iced::widget::rule::FillMode::Full,
+                snap: false,
+            }),
         ]
-        .spacing(4);
+        .spacing(6);
 
         let content = match self.tab {
             Tab::Results => self.results_view(),
