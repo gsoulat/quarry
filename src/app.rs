@@ -17,6 +17,7 @@ use crate::connector::{
     execution_order,
 };
 use crate::diagram::{self, Diagram};
+use crate::editing::{self, Dialog, DialogMessage, Refresh, RenameForm, RowForm, TableForm};
 use crate::manager::{self, Feedback, Field, Manager};
 use crate::store::{self, ConnectionConfig, Engine, Location};
 use crate::theme;
@@ -32,9 +33,16 @@ const SIDEBAR_RATIO: f32 = 0.2;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Results,
+    Data,
     Plan,
     Schema,
     Diagram,
+}
+
+/// Que fait un clic sur une cellule de la grille.
+enum CellAction {
+    Copy,
+    SelectRow(fn(usize) -> Message),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -73,6 +81,14 @@ pub struct App {
     folded: HashSet<u64>,
     diagram: Option<Diagram>,
     diagram_loading: bool,
+    /// Lignes de la table sélectionnée (onglet Données).
+    data: Option<QueryResult>,
+    data_table: Option<TableRef>,
+    data_row: Option<usize>,
+    /// Colonne sélectionnée dans l'onglet Schéma.
+    schema_row: Option<usize>,
+    dialog: Option<Dialog>,
+    dialog_error: Option<String>,
     selected: Option<TableRef>,
     schema: Vec<ColumnInfo>,
     editor: text_editor::Content,
@@ -99,7 +115,17 @@ pub enum Message {
     FilterChanged(String),
     ToggleSchema(String),
     ToggleFold(u64),
+    ToggleFolder(String),
     PaneResized(pane_grid::ResizeEvent),
+
+    // Édition
+    LoadData,
+    DataLoaded(TableRef, Result<QueryResult>),
+    DataRowSelected(usize),
+    SchemaRowSelected(usize),
+    OpenDialog(Dialog),
+    Dialog(DialogMessage),
+    Executed(Refresh, Result<u64>),
 
     // Diagramme
     LoadDiagram,
@@ -172,6 +198,12 @@ impl App {
             folded: HashSet::new(),
             diagram: None,
             diagram_loading: false,
+            data: None,
+            data_table: None,
+            data_row: None,
+            schema_row: None,
+            dialog: None,
+            dialog_error: None,
             selected: None,
             schema: Vec::new(),
             editor: text_editor::Content::with_text("SELECT 1 AS hello"),
@@ -244,6 +276,8 @@ impl App {
                 self.collapsed.clear();
                 self.folded.remove(&id);
                 self.diagram = None;
+                self.data = None;
+                self.data_table = None;
                 return Task::perform(async move { c.list_tables().await }, Message::TablesLoaded);
             }
             Message::Connected(_, Err(e)) => {
@@ -255,6 +289,8 @@ impl App {
                 self.selected = None;
                 self.schema.clear();
                 self.diagram = None;
+                self.data = None;
+                self.data_table = None;
                 self.status = Status::Idle;
             }
             Message::TablesLoaded(Ok(tables)) => {
@@ -266,11 +302,18 @@ impl App {
                 let Some(c) = self.connector() else { return Task::none() };
                 self.editor = text_editor::Content::with_text(&c.preview_sql(&table));
                 self.selected = Some(table.clone());
-                self.tab = Tab::Schema;
-                return Task::perform(
+                self.schema_row = None;
+                if self.tab != Tab::Data {
+                    self.tab = Tab::Schema;
+                }
+                let describe = Task::perform(
                     async move { c.describe_table(&table).await },
                     Message::SchemaLoaded,
                 );
+                if self.tab == Tab::Data {
+                    return Task::batch([describe, self.update(Message::LoadData)]);
+                }
+                return describe;
             }
             Message::InsertTable(table) => {
                 let Some(c) = self.connector() else { return Task::none() };
@@ -297,7 +340,94 @@ impl App {
                     self.folded.insert(id);
                 }
             }
+            Message::ToggleFolder(folder) => {
+                let key = format!("folder:{folder}");
+                if !self.collapsed.remove(&key) {
+                    self.collapsed.insert(key);
+                }
+            }
             Message::PaneResized(event) => self.panes.resize(event.split, event.ratio),
+
+            Message::LoadData => {
+                let (Some(c), Some(table)) = (self.connector(), self.selected.clone()) else {
+                    return Task::none();
+                };
+                self.status = Status::Busy(format!("Lecture de {table}…"));
+                let sql = c.data_sql(&table);
+                let t = table.clone();
+                return Task::perform(
+                    async move { c.query(&sql).await },
+                    move |r| Message::DataLoaded(t.clone(), r),
+                );
+            }
+            Message::DataLoaded(table, Ok(result)) => {
+                self.status = Status::Info(format!("{} ligne(s) dans {table}", result.rows.len()));
+                self.data = Some(result);
+                self.data_table = Some(table);
+                self.data_row = None;
+            }
+            Message::DataLoaded(_, Err(e)) => self.status = Status::Error(e),
+            Message::DataRowSelected(i) => {
+                self.data_row = if self.data_row == Some(i) { None } else { Some(i) };
+            }
+            Message::SchemaRowSelected(i) => {
+                self.schema_row = if self.schema_row == Some(i) { None } else { Some(i) };
+            }
+            Message::OpenDialog(dialog) => {
+                self.dialog = Some(dialog);
+                self.dialog_error = None;
+            }
+            Message::Dialog(DialogMessage::Cancel) => {
+                self.dialog = None;
+                self.dialog_error = None;
+            }
+            Message::Dialog(DialogMessage::Submit) => {
+                let (Some(dialog), Some(c)) = (&self.dialog, self.connector()) else {
+                    return Task::none();
+                };
+                match dialog.to_sql(c.as_ref()) {
+                    Ok(pending) => {
+                        self.dialog = Some(Dialog::Confirm(pending));
+                        self.dialog_error = None;
+                    }
+                    Err(e) => self.dialog_error = Some(e),
+                }
+            }
+            Message::Dialog(DialogMessage::Execute) => {
+                let (Some(Dialog::Confirm(pending)), Some(c)) = (&self.dialog, self.connector()) else {
+                    return Task::none();
+                };
+                let (sql, refresh) = (pending.sql.clone(), pending.refresh);
+                self.dialog = None;
+                self.status = Status::Busy("Exécution…".into());
+                return Task::perform(
+                    async move { c.execute(&sql).await },
+                    move |r| Message::Executed(refresh, r),
+                );
+            }
+            Message::Dialog(message) => {
+                if let Some(dialog) = &mut self.dialog {
+                    dialog.apply(message);
+                }
+            }
+            Message::Executed(refresh, Ok(affected)) => {
+                self.status = Status::Info(format!("Exécuté · {affected} ligne(s) touchée(s)"));
+                let Some(c) = self.connector() else { return Task::none() };
+                return match refresh {
+                    Refresh::Data => self.update(Message::LoadData),
+                    Refresh::Structure => {
+                        // La table sélectionnée a pu changer de nom ou disparaître.
+                        self.selected = None;
+                        self.schema.clear();
+                        self.schema_row = None;
+                        self.data = None;
+                        self.data_table = None;
+                        self.diagram = None;
+                        Task::perform(async move { c.list_tables().await }, Message::TablesLoaded)
+                    }
+                };
+            }
+            Message::Executed(_, Err(e)) => self.status = Status::Error(e),
 
             Message::LoadDiagram => {
                 let Some(session) = &self.session else { return Task::none() };
@@ -476,6 +606,9 @@ impl App {
                 if tab == Tab::Diagram && self.diagram.is_none() && !self.diagram_loading {
                     return self.update(Message::LoadDiagram);
                 }
+                if tab == Tab::Data && self.data_table != self.selected {
+                    return self.update(Message::LoadData);
+                }
             }
             Message::PageChanged(page) => self.page = page,
             Message::CopyCell(value) => {
@@ -496,6 +629,9 @@ impl App {
     /// Raccourcis globaux (hors éditeur, qui a les siens).
     fn handle_key(&mut self, key: Key, modifiers: Modifiers) -> Task<Message> {
         match key.as_ref() {
+            Key::Named(Named::Escape) if self.dialog.is_some() => {
+                self.update(Message::Dialog(DialogMessage::Cancel))
+            }
             Key::Named(Named::Escape) if self.manager.is_some() => self.update(Message::CloseManager),
             Key::Named(Named::Enter) if modifiers.command() => self.update(Message::Run),
             Key::Character("e") if modifiers.command() => self.update(Message::Explain),
@@ -559,8 +695,11 @@ impl App {
 
         let base = column![self.top_bar(), panes, self.status_bar()].spacing(10).padding(12);
 
-        match &self.manager {
-            Some(m) => stack![base, manager::view(m, &self.connections)].into(),
+        if let Some(m) = &self.manager {
+            return stack![base, manager::view(m, &self.connections)].into();
+        }
+        match &self.dialog {
+            Some(d) => stack![base, editing::view(d, self.dialog_error.as_deref())].into(),
             None => base.into(),
         }
     }
@@ -610,9 +749,47 @@ impl App {
     fn sidebar(&self) -> Element<'_, Message> {
         let mut list = Column::new().spacing(2);
 
+        // Les dossiers d'abord (repliables), puis les connexions sans dossier
+        // par emplacement.
+        let mut folders: Vec<&str> = self
+            .connections
+            .iter()
+            .map(|c| c.folder.as_str())
+            .filter(|f| !f.is_empty())
+            .collect();
+        folders.sort_unstable();
+        folders.dedup();
+
+        for folder in folders {
+            let collapsed = self.collapsed.contains(&format!("folder:{folder}"));
+            let count = self.connections.iter().filter(|c| c.folder == folder).count();
+            list = list.push(
+                button(
+                    text(format!("{} {folder}  ({count})", if collapsed { "▸" } else { "▾" }))
+                        .size(12)
+                        .color(theme::TEXT)
+                        .wrapping(text::Wrapping::None),
+                )
+                .on_press(Message::ToggleFolder(folder.to_owned()))
+                .style(theme::list_item(false))
+                .padding([4, 6])
+                .width(Fill)
+                .clip(true),
+            );
+            if collapsed {
+                continue;
+            }
+            for config in self.connections.iter().filter(|c| c.folder == folder) {
+                list = list.push(container(self.connection_entry(config)).padding(padding::left(10)));
+            }
+        }
+
         for location in Location::ALL {
-            let group: Vec<_> =
-                self.connections.iter().filter(|c| c.location() == location).collect();
+            let group: Vec<_> = self
+                .connections
+                .iter()
+                .filter(|c| c.folder.is_empty() && c.location() == location)
+                .collect();
             if group.is_empty() {
                 continue;
             }
@@ -663,6 +840,9 @@ impl App {
         let folded = self.folded.contains(&config.id);
         let entry = button(
             row![
+                text(if session.is_none() { " " } else if folded { "▸" } else { "▾" })
+                    .size(12)
+                    .color(theme::MUTED),
                 marker.size(10),
                 column![
                     text(&config.name).size(13).wrapping(text::Wrapping::None),
@@ -683,12 +863,8 @@ impl App {
 
         let Some(session) = session else { return entry.into() };
 
-        // Connexion ouverte : une flèche replie sa liste de tables.
-        let fold = button(text(if folded { "▸" } else { "▾" }).size(12).color(theme::MUTED))
-            .on_press(Message::ToggleFold(config.id))
-            .style(theme::list_item(false))
-            .padding([3, 6]);
-        let entry = row![entry, fold].spacing(2).align_y(iced::Center);
+        // Connexion ouverte : la flèche devant le nom replie sa liste de tables.
+        let entry = entry.on_press(Message::ToggleFold(config.id));
         if folded {
             return entry.into();
         }
@@ -732,6 +908,15 @@ impl App {
         if session.tables.is_empty() {
             tree = tree.push(text("Aucune table").size(12).color(theme::MUTED));
         }
+
+        let default_schema = session.tables.iter().find_map(|t| t.schema.as_deref()).map(str::to_owned);
+        tree = tree.push(
+            button(text("+ Nouvelle table").size(12))
+                .on_press(Message::OpenDialog(Dialog::Table(TableForm::new(default_schema.as_deref()))))
+                .style(theme::list_item(false))
+                .padding([3, 6])
+                .width(Fill),
+        );
 
         column![entry, container(tree).padding(padding::left(12))].spacing(2).into()
     }
@@ -807,14 +992,16 @@ impl App {
         };
         let tabs = row![
             tab("Résultats", Tab::Results),
-            tab("Plan d'exécution", Tab::Plan),
+            tab("Données", Tab::Data),
             tab("Schéma", Tab::Schema),
+            tab("Plan d'exécution", Tab::Plan),
             tab("Diagramme", Tab::Diagram),
         ]
         .spacing(4);
 
         let content = match self.tab {
             Tab::Results => self.results_view(),
+            Tab::Data => self.data_view(),
             Tab::Plan => self.plan_view(),
             Tab::Schema => self.schema_view(),
             Tab::Diagram => self.diagram_view(),
@@ -849,7 +1036,7 @@ impl App {
         let end = (start + PAGE_SIZE).min(total);
 
         let rows = result.rows[start..end].iter().map(|r| r.iter().map(|c| c.display()).collect());
-        let grid = grid(result.columns.clone(), rows);
+        let grid = grid(result.columns.clone(), rows, None, CellAction::Copy);
 
         let mut header = row![source_line(self.result_sql.as_deref())].spacing(12).align_y(iced::Center);
         if pages > 1 {
@@ -886,9 +1073,123 @@ impl App {
                 if c.primary_key { "PK" } else { "" }.into(),
             ]
         });
-        column![text(table.to_string()).size(15).color(theme::PRIMARY), grid(header, rows)]
-            .spacing(8)
-            .into()
+
+        let column = self.schema_row.and_then(|i| self.schema.get(i)).map(|c| c.name.clone());
+        let action = |label: &'static str, dialog: Option<Dialog>, danger: bool| {
+            let b = button(text(label).size(12)).on_press_maybe(dialog.map(Message::OpenDialog)).padding([3, 10]);
+            if danger { b.style(theme::outline(theme::DANGER)) } else { b.style(button::secondary) }
+        };
+        let drop_column = column.as_ref().and_then(|name| {
+            let c = self.connector()?;
+            Some(Dialog::Confirm(editing::Pending {
+                title: format!("Supprimer la colonne {name}"),
+                sql: c.alter_table_sql(table, &connector::Alter::DropColumn(name.clone())),
+                refresh: Refresh::Structure,
+            }))
+        });
+        let drop_table = self.connector().map(|c| {
+            Dialog::Confirm(editing::Pending {
+                title: format!("Supprimer la table {table}"),
+                sql: c.drop_table_sql(table),
+                refresh: Refresh::Structure,
+            })
+        });
+        let toolbar = row![
+            text(table.to_string()).size(15).color(theme::PRIMARY).width(Fill),
+            action(
+                "+ Colonne",
+                Some(Dialog::Column(editing::ColumnForm {
+                    table: table.clone(),
+                    draft: editing::ColumnDraft { name: String::new(), data_type: String::new(), nullable: true, primary_key: false },
+                })),
+                false,
+            ),
+            action(
+                "Renommer la colonne",
+                column.clone().map(|c| Dialog::Rename(RenameForm { table: table.clone(), column: Some(c), to: String::new() })),
+                false,
+            ),
+            action("Supprimer la colonne", drop_column, true),
+            action(
+                "Renommer la table",
+                Some(Dialog::Rename(RenameForm { table: table.clone(), column: None, to: String::new() })),
+                false,
+            ),
+            action("Supprimer la table", drop_table, true),
+        ]
+        .spacing(6)
+        .align_y(iced::Center);
+
+        column![
+            toolbar,
+            text("Clique sur une colonne pour la sélectionner.").size(11).color(theme::MUTED),
+            grid(header, rows, self.schema_row, CellAction::SelectRow(Message::SchemaRowSelected)),
+        ]
+        .spacing(6)
+        .into()
+    }
+
+    fn data_view(&self) -> Element<'_, Message> {
+        let Some(table) = &self.selected else {
+            return hint("Sélectionne une table dans la liste pour voir et modifier ses lignes.");
+        };
+        let Some(data) = self.data.as_ref().filter(|_| self.data_table.as_ref() == Some(table)) else {
+            return hint("Lecture des lignes…");
+        };
+
+        let has_pk = self.schema.iter().any(|c| c.primary_key);
+        let selected_row = self.data_row.and_then(|i| data.rows.get(i));
+        let columns = self.schema.clone();
+
+        let insert = Dialog::Row(RowForm::insert(table.clone(), columns.clone()));
+        let update = selected_row
+            .filter(|_| has_pk)
+            .map(|row| Dialog::Row(RowForm::update(table.clone(), columns.clone(), row)));
+        let delete = selected_row.filter(|_| has_pk).and_then(|row| {
+            let c = self.connector()?;
+            let key: Vec<_> = columns
+                .iter()
+                .enumerate()
+                .filter(|(_, col)| col.primary_key)
+                .filter_map(|(i, col)| Some((col.name.clone(), row.get(i)?.clone())))
+                .collect();
+            Some(Dialog::Confirm(editing::Pending {
+                title: format!("Supprimer une ligne de {table}"),
+                sql: c.delete_sql(table, &key),
+                refresh: Refresh::Data,
+            }))
+        });
+
+        let action = |label: &'static str, dialog: Option<Dialog>, danger: bool| {
+            let b = button(text(label).size(12)).on_press_maybe(dialog.map(Message::OpenDialog)).padding([3, 10]);
+            if danger { b.style(theme::outline(theme::DANGER)) } else { b.style(button::secondary) }
+        };
+        let toolbar = row![
+            text(table.to_string()).size(15).color(theme::PRIMARY).width(Fill),
+            action("+ Ligne", Some(insert), false),
+            action("Modifier", update, false),
+            action("Supprimer", delete, true),
+            button(text("Rafraîchir").size(12)).on_press(Message::LoadData).style(button::secondary).padding([3, 10]),
+        ]
+        .spacing(6)
+        .align_y(iced::Center);
+
+        let note = if !has_pk {
+            "Cette table n'a pas de clé primaire : on peut insérer, mais pas modifier ni supprimer une ligne sans risque."
+        } else if data.rows.len() >= connector::MAX_ROWS {
+            "Affichage limité aux premières lignes. Clique sur une ligne pour la sélectionner."
+        } else {
+            "Clique sur une ligne pour la sélectionner, puis Modifier ou Supprimer."
+        };
+
+        let rows = data.rows.iter().map(|r| r.iter().map(|c| c.display()).collect());
+        column![
+            toolbar,
+            text(note).size(11).color(theme::MUTED),
+            grid(data.columns.clone(), rows, self.data_row, CellAction::SelectRow(Message::DataRowSelected)),
+        ]
+        .spacing(6)
+        .into()
     }
 
     fn diagram_view(&self) -> Element<'_, Message> {
@@ -1035,7 +1336,12 @@ fn section(title: &str) -> Element<'_, Message> {
 
 /// Grille défilable dans les deux sens. Les colonnes prennent la largeur de
 /// leur contenu (bornée) et un clic sur une cellule copie sa valeur.
-fn grid<'a>(columns: Vec<String>, rows: impl Iterator<Item = Vec<String>>) -> Element<'a, Message> {
+fn grid<'a>(
+    columns: Vec<String>,
+    rows: impl Iterator<Item = Vec<String>>,
+    selected: Option<usize>,
+    action: CellAction,
+) -> Element<'a, Message> {
     let rows: Vec<Vec<String>> = rows.collect();
 
     let widths: Vec<f32> = columns
@@ -1065,15 +1371,24 @@ fn grid<'a>(columns: Vec<String>, rows: impl Iterator<Item = Vec<String>>) -> El
     let lines = rows.into_iter().enumerate().map(|(i, values)| {
         let cells = values.into_iter().zip(&widths).map(|(value, &w)| {
             let label = text(value.clone()).font(MONO).size(13).wrapping(text::Wrapping::None);
+            let message = match action {
+                CellAction::Copy => Message::CopyCell(value),
+                CellAction::SelectRow(f) => f(i),
+            };
             button(label)
-                .on_press(Message::CopyCell(value))
+                .on_press(message)
                 .style(theme::cell)
                 .width(w)
                 .padding([3, 8])
                 .clip(true)
                 .into()
         });
-        container(Row::with_children(cells)).style(theme::grid_row(i % 2 == 1)).into()
+        let line = container(Row::with_children(cells));
+        if selected == Some(i) {
+            line.style(theme::grid_row_selected).into()
+        } else {
+            line.style(theme::grid_row(i % 2 == 1)).into()
+        }
     });
 
     let body = column![header, Column::with_children(lines)].width(Length::Shrink);

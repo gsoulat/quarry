@@ -5,7 +5,8 @@ Client de bases de données léger et multiplateforme (macOS, Linux, Windows), �
 ## Fonctionnalités
 
 - **PostgreSQL**, **MySQL**, **SQLite** et **Google BigQuery**
-- **Gestionnaire de connexions** (bouton « Gérer ») : ajouter, tester, modifier, supprimer
+- **Gestionnaire de connexions** (bouton « Gérer ») : ajouter, tester, modifier, supprimer, ranger dans des **dossiers**
+- **Édition par l'interface** : créer / renommer / supprimer une table, ajouter / renommer / supprimer une colonne, insérer / modifier / supprimer une ligne (onglet Données). Le SQL généré est **affiché et confirmé avant exécution**
 - Barre latérale groupée en **Local / Distant / Cloud** : un clic pour se (re)connecter
 - Mots de passe stockés dans le **trousseau du système** (Keychain, Gestionnaire d'identification Windows, Secret Service), jamais en clair sur le disque
 - Tables groupées par schéma, filtre, barre latérale **redimensionnable**, bouton `+` pour **insérer le nom d'une table au curseur**
@@ -59,6 +60,7 @@ src/
 ├── store.rs             connexions enregistrées + trousseau
 ├── icon.rs              icône de fenêtre et du Dock
 ├── diagram.rs           diagramme des tables (canvas, placement, MPD/MLD/MCD)
+├── editing.rs           formulaires ligne / table / colonne et confirmation du SQL
 └── connector/
     ├── mod.rs           trait Connector commun à tous les moteurs
     ├── sql.rs           PostgreSQL / MySQL / SQLite via sqlx
@@ -80,6 +82,6 @@ Pour ajouter un moteur (MongoDB/DocumentDB…), il suffit d'implémenter le trai
 - [ ] Onglets de requêtes enregistrables
 - [ ] Connecteurs téléchargeables (processus séparés)
 - [ ] Tri et filtre des résultats
-- [ ] Édition des lignes : ajout, modification, suppression
+- [x] Édition des lignes et des tables par l'interface
 - [ ] Import de fichiers (CSV, Parquet, Excel) dans une table
 - [ ] Thème clair

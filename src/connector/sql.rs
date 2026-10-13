@@ -10,7 +10,7 @@ use sqlx::types::{JsonValue, Uuid};
 use sqlx::{AssertSqlSafe, Column, Row, TypeInfo, ValueRef};
 
 use super::plan::{self, QueryPlan};
-use super::{Cell, ColumnInfo, Connector, MAX_ROWS, QueryResult, Relation, Result, TableRef};
+use super::{Alter, Cell, ColumnInfo, Connector, MAX_ROWS, QueryResult, Relation, Result, TableRef};
 use crate::store::{ConnectionConfig, Engine};
 
 /// Peu de connexions suffisent pour un client interactif.
@@ -161,6 +161,25 @@ impl Connector for SqlConnector {
         match self {
             Self::MySql(_) => format!("`{}`", ident.replace('`', "``")),
             _ => format!("\"{}\"", ident.replace('"', "\"\"")),
+        }
+    }
+
+    fn quote_literal(&self, value: &str) -> String {
+        match self {
+            // MySQL interprète l'antislash dans les littéraux.
+            Self::MySql(_) => format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''")),
+            _ => format!("'{}'", value.replace('\'', "''")),
+        }
+    }
+
+    fn alter_table_sql(&self, table: &TableRef, alter: &Alter) -> String {
+        match (self, alter) {
+            // MySQL < 8 : RENAME COLUMN n'existe pas ; CHANGE exige le type,
+            // que l'on ne connaît pas ici. On garde la syntaxe standard (MySQL 8+).
+            (Self::MySql(_), Alter::RenameTable(to)) => {
+                format!("RENAME TABLE {} TO {}", self.quote_table(table), self.quote_identifier(to))
+            }
+            _ => default_alter_table_sql(self, table, alter),
         }
     }
 
@@ -427,6 +446,32 @@ impl Connector for SqlConnector {
             Self::Sqlite(pool) => run_query!(pool, sql, decode_sqlite),
         }
     }
+
+    async fn execute(&self, sql: &str) -> Result<u64> {
+        let sql = AssertSqlSafe(sql.to_owned());
+        let affected = match self {
+            Self::Postgres(pool) => sqlx::query(sql).execute(pool).await.map_err(err)?.rows_affected(),
+            Self::MySql(pool) => sqlx::query(sql).execute(pool).await.map_err(err)?.rows_affected(),
+            Self::Sqlite(pool) => sqlx::query(sql).execute(pool).await.map_err(err)?.rows_affected(),
+        };
+        Ok(affected)
+    }
+}
+
+/// Version standard de `alter_table_sql`, réutilisée quand le dialecte n'a
+/// pas de cas particulier.
+fn default_alter_table_sql(c: &SqlConnector, table: &TableRef, alter: &Alter) -> String {
+    let table = c.quote_table(table);
+    match alter {
+        Alter::AddColumn(column) => format!("ALTER TABLE {table}\nADD COLUMN {}", c.column_ddl(column)),
+        Alter::DropColumn(name) => format!("ALTER TABLE {table}\nDROP COLUMN {}", c.quote_identifier(name)),
+        Alter::RenameColumn { from, to } => format!(
+            "ALTER TABLE {table}\nRENAME COLUMN {} TO {}",
+            c.quote_identifier(from),
+            c.quote_identifier(to)
+        ),
+        Alter::RenameTable(to) => format!("ALTER TABLE {table}\nRENAME TO {}", c.quote_identifier(to)),
+    }
 }
 
 #[cfg(test)]
@@ -477,5 +522,55 @@ mod tests {
         assert_eq!(relations[0].from_columns, ["user_id"]);
         assert_eq!(relations[0].to.name, "users");
         assert_eq!(relations[0].to_columns, ["id"]);
+    }
+
+    #[tokio::test]
+    async fn generated_sql_round_trips() {
+        use super::super::{ColumnDef, Input};
+
+        let c = demo().await;
+        let users = TableRef { schema: None, name: "users".into() };
+
+        let insert = c.insert_sql(
+            &users,
+            &[("name".into(), Input::Text("O'Brien".into())), ("score".into(), Input::Null)],
+        );
+        assert_eq!(insert, "INSERT INTO \"users\" (\"name\", \"score\")\nVALUES ('O''Brien', NULL)");
+        assert_eq!(c.execute(&insert).await.unwrap(), 1);
+
+        let key = [("id".into(), Cell::Int(3))];
+        let update = c.update_sql(&users, &[("score".into(), Input::Text("7.5".into()))], &key);
+        assert_eq!(update, "UPDATE \"users\"\nSET \"score\" = '7.5'\nWHERE \"id\" = 3");
+        assert_eq!(c.execute(&update).await.unwrap(), 1);
+        let row = c.query("SELECT score FROM users WHERE id = 3").await.unwrap();
+        assert_eq!(row.rows[0][0].display(), "7.5");
+
+        assert_eq!(c.execute(&c.delete_sql(&users, &key)).await.unwrap(), 1);
+
+        let tags = TableRef { schema: None, name: "tags".into() };
+        let create = c.create_table_sql(
+            &tags,
+            &[
+                ColumnDef { name: "id".into(), data_type: "INTEGER".into(), nullable: false, primary_key: true },
+                ColumnDef { name: "label".into(), data_type: "TEXT".into(), nullable: true, primary_key: false },
+            ],
+        );
+        assert_eq!(
+            create,
+            "CREATE TABLE \"tags\" (\n    \"id\" INTEGER NOT NULL,\n    \"label\" TEXT,\n    PRIMARY KEY (\"id\")\n)"
+        );
+        c.execute(&create).await.unwrap();
+        let add = c.alter_table_sql(
+            &tags,
+            &Alter::AddColumn(ColumnDef { name: "color".into(), data_type: "TEXT".into(), nullable: true, primary_key: false }),
+        );
+        c.execute(&add).await.unwrap();
+        c.execute(&c.alter_table_sql(&tags, &Alter::RenameColumn { from: "color".into(), to: "colour".into() })).await.unwrap();
+        c.execute(&c.alter_table_sql(&tags, &Alter::DropColumn("colour".into()))).await.unwrap();
+        c.execute(&c.alter_table_sql(&tags, &Alter::RenameTable("labels".into()))).await.unwrap();
+        c.execute(&c.drop_table_sql(&TableRef { schema: None, name: "labels".into() })).await.unwrap();
+
+        let names: Vec<_> = c.list_tables().await.unwrap().into_iter().map(|t| t.name).collect();
+        assert_eq!(names, ["orders", "users"]);
     }
 }

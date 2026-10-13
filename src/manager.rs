@@ -13,6 +13,7 @@ use crate::theme;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
     Name,
+    Folder,
     Host,
     Port,
     User,
@@ -28,6 +29,7 @@ pub enum Field {
 pub struct Form {
     pub engine: Engine,
     pub name: String,
+    pub folder: String,
     pub host: String,
     pub port: String,
     pub user: String,
@@ -44,6 +46,7 @@ impl Form {
         Self {
             engine,
             name: String::new(),
+            folder: String::new(),
             host: "localhost".into(),
             port: engine.default_port().map(|p| p.to_string()).unwrap_or_default(),
             user: String::new(),
@@ -59,6 +62,7 @@ impl Form {
         Self {
             engine: config.engine,
             name: config.name.clone(),
+            folder: config.folder.clone(),
             host: config.host.clone(),
             port: config.port.map(|p| p.to_string()).unwrap_or_default(),
             user: config.user.clone(),
@@ -73,6 +77,7 @@ impl Form {
     pub fn set(&mut self, field: Field, value: String) {
         let target = match field {
             Field::Name => &mut self.name,
+            Field::Folder => &mut self.folder,
             Field::Host => &mut self.host,
             Field::Port => &mut self.port,
             Field::User => &mut self.user,
@@ -115,6 +120,7 @@ impl Form {
             id,
             name: self.name.trim().into(),
             engine: self.engine,
+            folder: self.folder.trim().into(),
             host: self.host.trim().into(),
             port,
             user: self.user.trim().into(),
@@ -231,6 +237,7 @@ fn form_view(manager: &Manager) -> Element<'_, Message> {
         header,
         row![
             input("Nom", "Production, Docker local…", &form.name, Field::Name).width(Fill),
+            input("Dossier", "Clients, Perso… (optionnel)", &form.folder, Field::Folder).width(Fill),
             column![
                 text("Moteur").size(12).color(theme::MUTED),
                 pick_list(Engine::ALL, Some(form.engine), Message::FormEngine).padding(8),

@@ -94,6 +94,32 @@ pub struct QueryResult {
     pub rows: Vec<Vec<Cell>>,
 }
 
+/// Valeur saisie dans un formulaire de ligne.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Input {
+    Null,
+    Default,
+    Text(String),
+}
+
+/// Colonne d'une table à créer.
+#[derive(Debug, Clone)]
+pub struct ColumnDef {
+    pub name: String,
+    pub data_type: String,
+    pub nullable: bool,
+    pub primary_key: bool,
+}
+
+/// Modification de structure d'une table existante.
+#[derive(Debug, Clone)]
+pub enum Alter {
+    AddColumn(ColumnDef),
+    DropColumn(String),
+    RenameColumn { from: String, to: String },
+    RenameTable(String),
+}
+
 #[async_trait]
 pub trait Connector: Send + Sync + fmt::Debug {
     /// Nom lisible du moteur (« PostgreSQL », « SQLite »…).
@@ -104,15 +130,126 @@ pub trait Connector: Send + Sync + fmt::Debug {
         format!("\"{}\"", ident.replace('"', "\"\""))
     }
 
-    /// Requête d'aperçu proposée quand on clique sur une table.
-    fn preview_sql(&self, table: &TableRef) -> String {
-        let name = match &table.schema {
+    /// Nom de table qualifié et protégé.
+    fn quote_table(&self, table: &TableRef) -> String {
+        match &table.schema {
             Some(schema) => {
                 format!("{}.{}", self.quote_identifier(schema), self.quote_identifier(&table.name))
             }
             None => self.quote_identifier(&table.name),
-        };
-        format!("SELECT * FROM {name} LIMIT 100")
+        }
+    }
+
+    /// Littéral texte : les apostrophes sont doublées (SQL standard).
+    fn quote_literal(&self, value: &str) -> String {
+        format!("'{}'", value.replace('\'', "''"))
+    }
+
+    /// Littéral d'une valeur lue dans la grille (pour cibler une ligne).
+    fn cell_literal(&self, cell: &Cell) -> String {
+        match cell {
+            Cell::Null => "NULL".into(),
+            Cell::Bool(b) => if *b { "TRUE" } else { "FALSE" }.into(),
+            Cell::Int(i) => i.to_string(),
+            Cell::Float(f) => f.to_string(),
+            Cell::Text(s) => self.quote_literal(s),
+            Cell::Unsupported(_) => "NULL".into(),
+        }
+    }
+
+    fn input_literal(&self, input: &Input) -> String {
+        match input {
+            Input::Null => "NULL".into(),
+            Input::Default => "DEFAULT".into(),
+            Input::Text(s) => self.quote_literal(s),
+        }
+    }
+
+    /// Clause `WHERE` qui cible une ligne par sa clé.
+    fn where_key(&self, key: &[(String, Cell)]) -> String {
+        key.iter()
+            .map(|(column, value)| {
+                let column = self.quote_identifier(column);
+                match value {
+                    Cell::Null => format!("{column} IS NULL"),
+                    other => format!("{column} = {}", self.cell_literal(other)),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    }
+
+    /// Requête d'aperçu proposée quand on clique sur une table.
+    fn preview_sql(&self, table: &TableRef) -> String {
+        format!("SELECT * FROM {} LIMIT 100", self.quote_table(table))
+    }
+
+    /// Toutes les lignes de la table (bornées par `MAX_ROWS` à la lecture).
+    fn data_sql(&self, table: &TableRef) -> String {
+        format!("SELECT * FROM {} LIMIT {MAX_ROWS}", self.quote_table(table))
+    }
+
+    fn insert_sql(&self, table: &TableRef, values: &[(String, Input)]) -> String {
+        let columns: Vec<_> = values.iter().map(|(c, _)| self.quote_identifier(c)).collect();
+        let literals: Vec<_> = values.iter().map(|(_, v)| self.input_literal(v)).collect();
+        format!(
+            "INSERT INTO {} ({})\nVALUES ({})",
+            self.quote_table(table),
+            columns.join(", "),
+            literals.join(", ")
+        )
+    }
+
+    fn update_sql(&self, table: &TableRef, set: &[(String, Input)], key: &[(String, Cell)]) -> String {
+        let assignments: Vec<_> = set
+            .iter()
+            .map(|(c, v)| format!("{} = {}", self.quote_identifier(c), self.input_literal(v)))
+            .collect();
+        format!(
+            "UPDATE {}\nSET {}\nWHERE {}",
+            self.quote_table(table),
+            assignments.join(",\n    "),
+            self.where_key(key)
+        )
+    }
+
+    fn delete_sql(&self, table: &TableRef, key: &[(String, Cell)]) -> String {
+        format!("DELETE FROM {}\nWHERE {}", self.quote_table(table), self.where_key(key))
+    }
+
+    fn column_ddl(&self, column: &ColumnDef) -> String {
+        let mut ddl = format!("{} {}", self.quote_identifier(&column.name), column.data_type.trim());
+        if !column.nullable || column.primary_key {
+            ddl.push_str(" NOT NULL");
+        }
+        ddl
+    }
+
+    fn create_table_sql(&self, table: &TableRef, columns: &[ColumnDef]) -> String {
+        let mut lines: Vec<_> = columns.iter().map(|c| format!("    {}", self.column_ddl(c))).collect();
+        let pk: Vec<_> = columns.iter().filter(|c| c.primary_key).map(|c| self.quote_identifier(&c.name)).collect();
+        if !pk.is_empty() {
+            lines.push(format!("    PRIMARY KEY ({})", pk.join(", ")));
+        }
+        format!("CREATE TABLE {} (\n{}\n)", self.quote_table(table), lines.join(",\n"))
+    }
+
+    fn drop_table_sql(&self, table: &TableRef) -> String {
+        format!("DROP TABLE {}", self.quote_table(table))
+    }
+
+    fn alter_table_sql(&self, table: &TableRef, alter: &Alter) -> String {
+        let table = self.quote_table(table);
+        match alter {
+            Alter::AddColumn(column) => format!("ALTER TABLE {table}\nADD COLUMN {}", self.column_ddl(column)),
+            Alter::DropColumn(name) => format!("ALTER TABLE {table}\nDROP COLUMN {}", self.quote_identifier(name)),
+            Alter::RenameColumn { from, to } => format!(
+                "ALTER TABLE {table}\nRENAME COLUMN {} TO {}",
+                self.quote_identifier(from),
+                self.quote_identifier(to)
+            ),
+            Alter::RenameTable(to) => format!("ALTER TABLE {table}\nRENAME TO {}", self.quote_identifier(to)),
+        }
     }
 
     async fn list_tables(&self) -> Result<Vec<TableRef>>;
@@ -126,6 +263,10 @@ pub trait Connector: Send + Sync + fmt::Debug {
     async fn explain(&self, sql: &str) -> Result<QueryPlan>;
 
     async fn query(&self, sql: &str) -> Result<QueryResult>;
+
+    /// Exécute une instruction sans résultat (INSERT, UPDATE, DDL…) et
+    /// renvoie le nombre de lignes touchées quand le moteur le connaît.
+    async fn execute(&self, sql: &str) -> Result<u64>;
 }
 
 /// Ouvre une connexion enregistrée, avec son mot de passe éventuel.

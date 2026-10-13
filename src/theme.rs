@@ -83,12 +83,22 @@ pub fn status_bar(_theme: &Theme) -> container::Style {
 pub fn outline(color: Color) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |_theme, status| {
         let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        // Désactivé : gris et sans relief, pour qu'on voie qu'il n'y a rien à faire.
+        let color = if matches!(status, button::Status::Disabled) { Color { a: 0.35, ..MUTED } } else { color };
         button::Style {
             background: hovered.then_some(Background::Color(Color { a: 0.15, ..color })),
             text_color: color,
             border: Border { color, width: 1.0, radius: 6.0.into() },
             ..button::Style::default()
         }
+    }
+}
+
+/// Ligne de grille sélectionnée.
+pub fn grid_row_selected(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color { a: 0.22, ..PRIMARY })),
+        ..container::Style::default()
     }
 }
 

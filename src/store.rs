@@ -72,6 +72,9 @@ pub struct ConnectionConfig {
     pub id: u64,
     pub name: String,
     pub engine: Engine,
+    /// Dossier de rangement dans la barre latérale (vide = aucun).
+    #[serde(default)]
+    pub folder: String,
     #[serde(default)]
     pub host: String,
     #[serde(default)]

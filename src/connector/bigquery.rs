@@ -282,4 +282,11 @@ impl Connector for BigQueryConnector {
             rows: rows.unwrap_or_default().into_iter().map(decode_row).collect(),
         })
     }
+
+    async fn execute(&self, sql: &str) -> Result<u64> {
+        let mut request = Self::query_request(sql);
+        request.timeout_ms = Some(QUERY_TIMEOUT_MS);
+        let response = self.client.job().query(&self.project_id, request).await.map_err(err)?;
+        Ok(response.num_dml_affected_rows.as_deref().and_then(|n| n.parse().ok()).unwrap_or(0))
+    }
 }
