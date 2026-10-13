@@ -30,6 +30,7 @@ const MIN_CELL: f32 = 70.0;
 const MAX_CELL: f32 = 420.0;
 const PAGE_SIZE: usize = 200;
 const SIDEBAR_RATIO: f32 = 0.2;
+const EDITOR_RATIO: f32 = 0.3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -90,6 +91,13 @@ enum Pane {
     Workspace,
 }
 
+/// Panneaux de l'espace de travail : éditeur en haut, résultats en bas.
+#[derive(Debug, Clone, Copy)]
+enum WorkPane {
+    Editor,
+    Results,
+}
+
 #[derive(Debug, Clone)]
 enum Status {
     Idle,
@@ -117,6 +125,9 @@ pub struct App {
     next_tab_id: u64,
     history: Vec<HistoryEntry>,
     panes: pane_grid::State<Pane>,
+    work_panes: pane_grid::State<WorkPane>,
+    sidebar_hidden: bool,
+    results_hidden: bool,
     /// Filtre de la liste des tables.
     filter: String,
     /// Schémas repliés dans la barre latérale.
@@ -162,6 +173,11 @@ pub enum Message {
     ToggleFold(u64),
     ToggleFolder(String),
     PaneResized(pane_grid::ResizeEvent),
+    WorkPaneResized(pane_grid::ResizeEvent),
+    ToggleSidebar,
+    ToggleResults,
+    /// Relit tables, schémas, table sélectionnée et diagramme.
+    Refresh,
 
     // Édition
     LoadData,
@@ -249,6 +265,12 @@ impl App {
             a: Box::new(pane_grid::Configuration::Pane(Pane::Sidebar)),
             b: Box::new(pane_grid::Configuration::Pane(Pane::Workspace)),
         });
+        let work_panes = pane_grid::State::with_configuration(pane_grid::Configuration::Split {
+            axis: pane_grid::Axis::Horizontal,
+            ratio: EDITOR_RATIO,
+            a: Box::new(pane_grid::Configuration::Pane(WorkPane::Editor)),
+            b: Box::new(pane_grid::Configuration::Pane(WorkPane::Results)),
+        });
 
         Self {
             connections,
@@ -256,6 +278,9 @@ impl App {
             connecting: None,
             manager,
             panes,
+            work_panes,
+            sidebar_hidden: false,
+            results_hidden: false,
             filter: String::new(),
             collapsed: HashSet::new(),
             folded: HashSet::new(),
@@ -496,6 +521,19 @@ impl App {
                 }
             }
             Message::PaneResized(event) => self.panes.resize(event.split, event.ratio),
+            Message::WorkPaneResized(event) => self.work_panes.resize(event.split, event.ratio),
+            Message::ToggleSidebar => self.sidebar_hidden = !self.sidebar_hidden,
+            Message::Refresh => {
+                if self.session.is_none() {
+                    return Task::none();
+                }
+                self.status = Status::Busy("Actualisation…".into());
+                self.diagram = None;
+                self.data = None;
+                self.data_table = None;
+                return self.reload_structure();
+            }
+            Message::ToggleResults => self.results_hidden = !self.results_hidden,
 
             Message::LoadData => {
                 let (Some(c), Some(table)) = (self.connector(), self.selected.clone()) else {
@@ -908,6 +946,7 @@ impl App {
             Key::Named(Named::Escape) if self.manager.is_some() => self.update(Message::CloseManager),
             Key::Named(Named::Enter) if modifiers.command() => self.update(Message::Run),
             Key::Character("e") if modifiers.command() => self.update(Message::Explain),
+            Key::Character("r") if modifiers.command() => self.update(Message::Refresh),
             _ => Task::none(),
         }
     }
@@ -1083,18 +1122,29 @@ impl App {
     // ----------------------------------------------------------------------
 
     pub fn view(&self) -> Element<'_, Message> {
-        let panes = pane_grid(&self.panes, |_, pane, _| {
-            pane_grid::Content::new(match pane {
-                Pane::Sidebar => self.sidebar(),
-                Pane::Workspace => self.workspace(),
+        let body: Element<'_, Message> = if self.sidebar_hidden {
+            // Barre repliée : une languette verticale pour la rouvrir.
+            let strip = button(text("▶\nC\nO\nN\nN\nE\nX\nI\nO\nN\nS").size(11).color(theme::MUTED))
+                .on_press(Message::ToggleSidebar)
+                .style(theme::list_item(false))
+                .padding([8, 4])
+                .height(Fill);
+            row![container(strip).style(theme::panel), self.workspace()].spacing(10).height(Fill).into()
+        } else {
+            pane_grid(&self.panes, |_, pane, _| {
+                pane_grid::Content::new(match pane {
+                    Pane::Sidebar => self.sidebar(),
+                    Pane::Workspace => self.workspace(),
+                })
             })
-        })
-        .on_resize(8, Message::PaneResized)
-        .style(theme::pane_grid)
-        .spacing(10)
-        .height(Fill);
+            .on_resize(8, Message::PaneResized)
+            .style(theme::pane_grid)
+            .spacing(10)
+            .height(Fill)
+            .into()
+        };
 
-        let base = column![self.top_bar(), panes, self.status_bar()].spacing(10).padding(12);
+        let base = column![self.top_bar(), body, self.status_bar()].spacing(10).padding(12);
         let base: Element<'_, Message> = if self.edit_menu && self.session.is_some() {
             stack![base, self.edit_menu()].into()
         } else {
@@ -1147,7 +1197,7 @@ impl App {
 
     fn status_bar(&self) -> Element<'_, Message> {
         let (label, color) = match &self.status {
-            Status::Idle => ("Prêt · ⌘↩ exécuter · ⌘E expliquer".to_string(), theme::MUTED),
+            Status::Idle => ("Prêt · ⌘↩ exécuter · ⌘E expliquer · ⌘R actualiser".to_string(), theme::MUTED),
             Status::Busy(msg) => (msg.clone(), theme::WARNING),
             Status::Info(msg) => (msg.clone(), theme::SUCCESS),
             Status::Error(msg) => (msg.clone(), theme::DANGER),
@@ -1221,8 +1271,23 @@ impl App {
 
         let header = row![
             text("CONNEXIONS").size(11).color(theme::MUTED).width(Fill),
+            tooltip(
+                button(text("↻").size(13))
+                    .on_press_maybe(self.session.as_ref().map(|_| Message::Refresh))
+                    .style(button::text)
+                    .padding([2, 4]),
+                text("Actualiser (⌘R)").size(12),
+                tooltip::Position::Bottom,
+            )
+            .style(theme::tooltip)
+            .padding(6),
             button(text("Gérer").size(12)).on_press(Message::OpenManager).style(button::text),
+            button(text("◀").size(11).color(theme::MUTED))
+                .on_press(Message::ToggleSidebar)
+                .style(button::text)
+                .padding([2, 4]),
         ]
+        .spacing(4)
         .align_y(iced::Center);
 
         let filter = text_input("Filtrer les tables…", &self.filter)
@@ -1409,7 +1474,8 @@ impl App {
             .into()
     }
 
-    fn workspace(&self) -> Element<'_, Message> {
+    /// Haut de l'espace de travail : onglets de requêtes, éditeur, actions.
+    fn editor_pane(&self) -> Element<'_, Message> {
         let connected = self.session.is_some();
 
         let editor = text_editor(&self.tab().editor)
@@ -1417,7 +1483,7 @@ impl App {
             .key_binding(editor_key_binding)
             .highlight("sql", highlighter::Theme::Base16Ocean)
             .font(MONO)
-            .height(170)
+            .height(Fill)
             .padding(10);
 
         let actions = row![
@@ -1430,11 +1496,21 @@ impl App {
                 .padding([6, 14]),
             text("La sélection seule est exécutée si elle existe.")
                 .size(12)
-                .color(theme::MUTED),
+                .color(theme::MUTED)
+                .width(Fill),
+            button(text(if self.results_hidden { "▲ Résultats" } else { "▼ Replier les résultats" }).size(11))
+                .on_press(Message::ToggleResults)
+                .style(button::text)
+                .padding([2, 6]),
         ]
         .spacing(10)
         .align_y(iced::Center);
 
+        column![self.query_tab_bar(), editor, actions].spacing(10).width(Fill).height(Fill).into()
+    }
+
+    /// Bas de l'espace de travail : les onglets Résultats, Données, Schéma…
+    fn results_pane(&self) -> Element<'_, Message> {
         let tab = |label, tab| {
             button(text(label).size(13))
                 .on_press(Message::TabSelected(tab))
@@ -1460,18 +1536,30 @@ impl App {
             Tab::History => self.history_view(),
         };
 
-        column![
-            self.query_tab_bar(),
-            editor,
-            actions,
-            container(column![tabs, content].spacing(8))
-                .style(theme::panel)
-                .padding(10)
-                .width(Fill)
-                .height(Fill),
-        ]
+        container(column![tabs, content].spacing(8))
+            .style(theme::panel)
+            .padding(10)
+            .width(Fill)
+            .height(Fill)
+            .into()
+    }
+
+    fn workspace(&self) -> Element<'_, Message> {
+        if self.results_hidden {
+            // Partie basse repliée : l'éditeur prend toute la hauteur.
+            return self.editor_pane();
+        }
+        pane_grid(&self.work_panes, |_, pane, _| {
+            pane_grid::Content::new(match pane {
+                WorkPane::Editor => self.editor_pane(),
+                WorkPane::Results => self.results_pane(),
+            })
+        })
+        .on_resize(8, Message::WorkPaneResized)
+        .style(theme::pane_grid)
         .spacing(10)
         .width(Fill)
+        .height(Fill)
         .into()
     }
 
@@ -1750,11 +1838,23 @@ impl App {
 
         let has_pk = self.schema.iter().any(|c| c.primary_key);
 
+        let mut toolbar = row![text(table.to_string()).size(15).color(theme::PRIMARY).width(Fill)];
+        if self.editing_cell.is_some() {
+            toolbar = toolbar
+                .push(text("Cellule en cours de modification").size(12).color(theme::WARNING))
+                .push(button(text("Enregistrer").size(12)).on_press(Message::CellEditSubmit).padding([3, 10]))
+                .push(
+                    button(text("Annuler").size(12))
+                        .on_press(Message::CellEditCancel)
+                        .style(button::secondary)
+                        .padding([3, 10]),
+                );
+        }
+        let toolbar = toolbar.push(action_button("+ Ligne", self.dialog_insert_row(), false))
+            .push(action_button("Modifier", self.dialog_update_row(), false))
+            .push(action_button("Supprimer", self.dialog_delete_row(), true));
         let toolbar = row![
-            text(table.to_string()).size(15).color(theme::PRIMARY).width(Fill),
-            action_button("+ Ligne", self.dialog_insert_row(), false),
-            action_button("Modifier", self.dialog_update_row(), false),
-            action_button("Supprimer", self.dialog_delete_row(), true),
+            toolbar,
             button(text("Rafraîchir").size(12)).on_press(Message::LoadData).style(button::secondary).padding([3, 10]),
         ]
         .spacing(6)
@@ -1763,9 +1863,9 @@ impl App {
         let note = if !has_pk {
             "Cette table n'a pas de clé primaire : on peut insérer, mais pas modifier ni supprimer une ligne sans risque."
         } else if data.rows.len() >= connector::MAX_ROWS {
-            "Affichage limité aux premières lignes. Clic : sélectionner · second clic sur une cellule : la modifier · en-tête : trier."
+            "Affichage limité aux premières lignes. Clic : sélectionner · double-clic sur une cellule : la modifier · en-tête : trier."
         } else {
-            "Clic : sélectionner · second clic sur une cellule de la ligne sélectionnée : la modifier · en-tête : trier."
+            "Clic : sélectionner · double-clic sur une cellule : la modifier, puis Enregistrer · en-tête : trier."
         };
 
         let order = order_rows(&data.rows, self.data_sort, &self.data_filter);
@@ -1944,6 +2044,7 @@ fn editor_key_binding(press: KeyPress) -> Option<Binding<Message>> {
         match press.key.as_ref() {
             Key::Named(Named::Enter) => return Some(Binding::Custom(Message::Run)),
             Key::Character("e") => return Some(Binding::Custom(Message::Explain)),
+            Key::Character("r") => return Some(Binding::Custom(Message::Refresh)),
             _ => {}
         }
     }
