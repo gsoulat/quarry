@@ -1,0 +1,22 @@
+[package]
+name = "quarry"
+version = "0.1.0"
+edition = "2024"
+description = "Client de bases de données léger et multiplateforme, écrit en Rust avec iced"
+
+[dependencies]
+async-trait = "0.1.92"
+futures-util = "0.3.34"
+iced = { version = "0.14", features = ["tokio"] }
+serde_json = "1.0.154"
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "mysql", "sqlite", "chrono", "uuid", "json"] }
+
+# Binaire le plus léger possible en release.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[dev-dependencies]
+tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread"] }
