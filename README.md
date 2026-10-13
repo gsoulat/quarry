@@ -14,6 +14,7 @@ Client de bases de données léger et multiplateforme (macOS, Linux, Windows), �
 - Éditeur SQL avec coloration, `⌘↩` exécute (la sélection seule si elle existe), `⌘E` explique
 - Grille de résultats paginée (200 lignes par page, 5 000 max), colonnes ajustées au contenu, **clic sur une cellule pour copier**
 - **Diagramme des tables** (onglet Diagramme) : clés étrangères dessinées sur un canvas, zoom et déplacement, boîtes déplaçables, placement automatique, trois niveaux **MPD / MLD / MCD**
+- **Mode Conception** : tables virtuelles créées sur le canvas, relations en glisser-déposer (1 → n, n → 1, n ↔ n avec table de jonction automatique), puis **génération du script** `CREATE TABLE` + `FOREIGN KEY` à exécuter sur la base connectée
 - **Plan d'exécution avant exécution** (`EXPLAIN`, sans `ANALYZE`) : arbre du plan, ordre d'exécution des étapes et coût estimé quand le moteur le fournit
 
 | Moteur | Plan | Coût estimé |
@@ -59,7 +60,8 @@ src/
 ├── manager.rs           fenêtre de gestion des connexions
 ├── store.rs             connexions enregistrées + trousseau
 ├── icon.rs              icône de fenêtre et du Dock
-├── diagram.rs           diagramme des tables (canvas, placement, MPD/MLD/MCD)
+├── diagram.rs           diagramme des tables (canvas, placement, MPD/MLD/MCD, conception)
+├── design.rs            panneau du mode conception et choix de relation
 ├── editing.rs           formulaires ligne / table / colonne et confirmation du SQL
 └── connector/
     ├── mod.rs           trait Connector commun à tous les moteurs

@@ -16,6 +16,7 @@ use crate::connector::{
     self, ColumnInfo, Connector, QueryPlan, QueryResult, Relation, Result, TableRef,
     execution_order,
 };
+use crate::design::{self, Design, DesignMessage};
 use crate::diagram::{self, Diagram};
 use crate::editing::{self, Dialog, DialogMessage, Refresh, RenameForm, RowForm, TableForm};
 use crate::manager::{self, Feedback, Field, Manager};
@@ -81,6 +82,7 @@ pub struct App {
     folded: HashSet<u64>,
     diagram: Option<Diagram>,
     diagram_loading: bool,
+    design: Design,
     /// Lignes de la table sélectionnée (onglet Données).
     data: Option<QueryResult>,
     data_table: Option<TableRef>,
@@ -139,6 +141,7 @@ pub enum Message {
     DiagramLayout,
     DiagramFit,
     DiagramInteraction(diagram::Interaction),
+    Design(DesignMessage),
 
     // Gestionnaire de connexions
     OpenManager,
@@ -203,6 +206,7 @@ impl App {
             folded: HashSet::new(),
             diagram: None,
             diagram_loading: false,
+            design: Design::default(),
             data: None,
             data_table: None,
             data_row: None,
@@ -500,11 +504,15 @@ impl App {
                     d.fit();
                 }
             }
+            Message::DiagramInteraction(diagram::Interaction::Link { from, to }) => {
+                self.design.pending_link = Some((from, to));
+            }
             Message::DiagramInteraction(interaction) => {
                 if let Some(d) = &mut self.diagram {
                     d.apply(interaction);
                 }
             }
+            Message::Design(message) => return self.update_design(message),
 
             Message::OpenManager => {
                 self.manager = Some(match self.active_config() {
@@ -653,6 +661,9 @@ impl App {
     /// Raccourcis globaux (hors éditeur, qui a les siens).
     fn handle_key(&mut self, key: Key, modifiers: Modifiers) -> Task<Message> {
         match key.as_ref() {
+            Key::Named(Named::Escape) if self.design.pending_link.is_some() => {
+                self.update(Message::Design(DesignMessage::LinkCancel))
+            }
             Key::Named(Named::Escape) if self.dialog.is_some() => {
                 self.update(Message::Dialog(DialogMessage::Cancel))
             }
@@ -661,6 +672,134 @@ impl App {
             Key::Character("e") if modifiers.command() => self.update(Message::Explain),
             _ => Task::none(),
         }
+    }
+
+    fn update_design(&mut self, message: DesignMessage) -> Task<Message> {
+        use DesignMessage as M;
+
+        let engine = self.active_config().map_or(Engine::Postgres, |c| c.engine);
+        let id_type = match engine {
+            Engine::Postgres => "SERIAL",
+            Engine::MySql => "INT",
+            Engine::Sqlite => "INTEGER",
+            Engine::BigQuery => "INT64",
+        };
+
+        // Le connecteur est pris avant l'emprunt mutable du diagramme.
+        let connector = self.connector();
+
+        // Entrée en conception sans diagramme chargé : on part de vide.
+        if matches!(message, M::Toggle | M::Clear) && self.diagram.is_none() {
+            let mut d = Diagram::empty();
+            d.editable = true;
+            self.diagram = Some(d);
+            if matches!(message, M::Toggle) {
+                return Task::none();
+            }
+        }
+        let Some(d) = &mut self.diagram else { return Task::none() };
+        let selected = d.selected;
+
+        match message {
+            M::Toggle => {
+                d.editable = !d.editable;
+                self.design.custom.clear();
+            }
+            M::Clear => {
+                let mut fresh = Diagram::empty();
+                fresh.editable = true;
+                *d = fresh;
+                self.design.custom.clear();
+            }
+            M::AddTable => {
+                let schema = d.nodes.iter().find_map(|n| n.table.schema.clone());
+                d.add_table(schema, id_type);
+            }
+            M::RemoveTable => {
+                if let Some(i) = selected {
+                    d.remove_table(i);
+                    self.design.custom.retain(|(t, _)| *t != i);
+                }
+            }
+            M::TableName(name) => {
+                if let Some(i) = selected {
+                    d.rename_table(i, &name);
+                }
+            }
+            M::ColumnName(c, v) => {
+                if let Some(i) = selected {
+                    d.edit_column(i, c, |col| col.name = v);
+                }
+            }
+            M::ColumnType(c, v) => {
+                if let Some(i) = selected {
+                    d.edit_column(i, c, |col| col.data_type = v);
+                }
+            }
+            M::ColumnCustom(c) => {
+                if let Some(i) = selected
+                    && !self.design.custom.remove(&(i, c))
+                {
+                    self.design.custom.insert((i, c));
+                }
+            }
+            M::ColumnNullable(c, v) => {
+                if let Some(i) = selected {
+                    d.edit_column(i, c, |col| col.nullable = v);
+                }
+            }
+            M::ColumnPrimary(c, v) => {
+                if let Some(i) = selected {
+                    d.edit_column(i, c, |col| {
+                        col.primary_key = v;
+                        if v {
+                            col.nullable = false;
+                        }
+                    });
+                }
+            }
+            M::AddColumn => {
+                if let Some(i) = selected {
+                    d.add_column(i);
+                }
+            }
+            M::RemoveColumn(c) => {
+                if let Some(i) = selected {
+                    d.remove_column(i, c);
+                    self.design.custom.remove(&(i, c));
+                }
+            }
+            M::RemoveRelation(r) => d.remove_relation(r),
+            M::LinkChosen(kind) => {
+                if let Some((from, to)) = self.design.pending_link.take() {
+                    match d.link(from, to, kind) {
+                        Ok(()) => self.status = Status::Info("Relation ajoutée".into()),
+                        Err(e) => self.status = Status::Error(e),
+                    }
+                }
+            }
+            M::LinkCancel => self.design.pending_link = None,
+            M::Script => {
+                let Some(c) = connector else {
+                    self.status = Status::Error("Ouvre une connexion pour générer le script".into());
+                    return Task::none();
+                };
+                match d.to_ddl(c.as_ref()) {
+                    Ok(sql) => {
+                        let count = d.nodes.iter().filter(|n| !n.existing).count();
+                        self.dialog = Some(Dialog::Confirm(editing::Pending {
+                            title: format!("Créer {count} table(s) d'après le diagramme"),
+                            sql,
+                            refresh: Refresh::Structure,
+                            select: None,
+                        }));
+                        self.dialog_error = None;
+                    }
+                    Err(e) => self.status = Status::Error(e),
+                }
+            }
+        }
+        Task::none()
     }
 
     fn save_connection(&mut self, connect: bool) -> Task<Message> {
@@ -1310,17 +1449,33 @@ impl App {
     }
 
     fn diagram_view(&self) -> Element<'_, Message> {
-        if self.session.is_none() {
-            return hint("Ouvre une connexion pour voir le diagramme de ses tables.");
-        }
         let Some(d) = &self.diagram else {
             return if self.diagram_loading {
                 hint("Lecture des tables et des relations…")
             } else {
-                container(
-                    button(text("Charger le diagramme").size(13))
-                        .on_press(Message::LoadDiagram)
+                let mut actions = row![].spacing(10);
+                if self.session.is_some() {
+                    actions = actions.push(
+                        button(text("Charger le diagramme de la base").size(13))
+                            .on_press(Message::LoadDiagram)
+                            .padding([6, 14]),
+                    );
+                }
+                actions = actions.push(
+                    button(text("Concevoir un nouveau schéma").size(13))
+                        .on_press(Message::Design(DesignMessage::Toggle))
+                        .style(button::secondary)
                         .padding([6, 14]),
+                );
+                container(
+                    column![
+                        actions,
+                        text("La conception dessine des tables virtuelles ; le script généré les crée dans la base connectée.")
+                            .size(12)
+                            .color(theme::MUTED),
+                    ]
+                    .spacing(10)
+                    .align_x(iced::Center),
                 )
                 .center(Fill)
                 .into()
@@ -1340,24 +1495,30 @@ impl App {
                 .padding([3, 10])
         };
         let modes = Row::with_children(diagram::Mode::ALL.map(|m| mode(m).into())).spacing(4);
-        let toolbar = row![
-            modes,
-            text(d.mode.description()).size(12).color(theme::MUTED).width(Fill),
-            tool("Réorganiser", Message::DiagramLayout),
-            tool("Ajuster", Message::DiagramFit),
-            tool("Recharger", Message::LoadDiagram),
-        ]
-        .spacing(6)
-        .align_y(iced::Center);
+        let design_toggle = button(text(if d.editable { "Conception ✓" } else { "Conception" }).size(12))
+            .on_press(Message::Design(DesignMessage::Toggle))
+            .style(theme::outline(if d.editable { theme::SUCCESS } else { theme::PRIMARY }))
+            .padding([3, 10]);
 
-        let mut info = Vec::new();
-        if d.relations.is_empty() {
-            info.push("Aucune clé étrangère déclarée : les tables s'affichent sans liens.");
+        let mut toolbar = row![modes, design_toggle].spacing(6).align_y(iced::Center);
+        if d.editable {
+            toolbar = toolbar
+                .push(tool("+ Table", Message::Design(DesignMessage::AddTable)))
+                .push(tool("Générer le script", Message::Design(DesignMessage::Script)))
+                .push(tool("Vider", Message::Design(DesignMessage::Clear)));
         }
-        let hint_text = text(if info.is_empty() {
-            "Molette : zoom · glisser le fond : déplacer · glisser une boîte : la ranger"
+        toolbar = toolbar
+            .push(text(d.mode.description()).size(12).color(theme::MUTED).width(Fill))
+            .push(tool("Réorganiser", Message::DiagramLayout))
+            .push(tool("Ajuster", Message::DiagramFit))
+            .push(tool("Recharger", Message::LoadDiagram));
+
+        let hint_text = text(if d.editable {
+            "Tire la poignée ● d'une table jusqu'à une autre pour les lier · clic sur une table : la modifier à droite"
+        } else if d.relations.is_empty() && !d.nodes.is_empty() {
+            "Aucune clé étrangère déclarée : les tables s'affichent sans liens."
         } else {
-            info[0]
+            "Molette : zoom · glisser le fond : déplacer · glisser une boîte : la ranger"
         })
         .size(11)
         .color(theme::MUTED);
@@ -1365,7 +1526,20 @@ impl App {
         let canvas = canvas(d).width(Fill).height(Fill);
         let canvas = Element::from(canvas).map(Message::DiagramInteraction);
 
-        column![toolbar, hint_text, canvas].spacing(6).into()
+        let body: Element<'_, Message> = if d.editable {
+            let engine = self.active_config().map_or(Engine::Postgres, |c| c.engine);
+            row![canvas, design::panel(&self.design, d, engine)].spacing(8).into()
+        } else {
+            canvas
+        };
+
+        let view = column![toolbar, hint_text, body].spacing(6);
+        match self.design.pending_link {
+            Some((from, to)) if from < d.nodes.len() && to < d.nodes.len() => {
+                stack![view, design::link_prompt(d, from, to)].into()
+            }
+            _ => view.into(),
+        }
     }
 
     fn plan_view(&self) -> Element<'_, Message> {

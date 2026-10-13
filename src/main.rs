@@ -1,5 +1,6 @@
 mod app;
 mod connector;
+mod design;
 mod diagram;
 mod editing;
 mod icon;

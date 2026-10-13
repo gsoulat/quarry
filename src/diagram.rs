@@ -14,7 +14,7 @@ use iced::mouse;
 use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke, Text};
 use iced::{Color, Event, Font, Point, Rectangle, Size, Vector, alignment};
 
-use crate::connector::{ColumnInfo, Relation, TableRef};
+use crate::connector::{ColumnDef, ColumnInfo, Connector, Relation, TableRef};
 use crate::theme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +52,19 @@ pub enum Interaction {
     Pan(Vector),
     Zoom { factor: f32, at: Point },
     Select(Option<usize>),
+    /// Poignée relâchée sur une autre table (mode conception).
+    Link { from: usize, to: usize },
+}
+
+/// Sens d'une relation créée en glisser-déposer, de `from` vers `to`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkKind {
+    /// Un `from` a plusieurs `to` : la clé étrangère va dans `to`.
+    OneToMany,
+    /// Plusieurs `from` pour un `to` : la clé étrangère va dans `from`.
+    ManyToOne,
+    /// Table de jonction entre les deux.
+    ManyToMany,
 }
 
 const FONT: Font = Font::MONOSPACE;
@@ -74,11 +87,20 @@ pub struct Node {
     lines: Vec<String>,
     /// Table de jonction (association n-n en MCD).
     junction: bool,
+    /// Table déjà présente dans la base (pas dans le script généré).
+    pub existing: bool,
 }
+
+const HANDLE_RADIUS: f32 = 6.0;
 
 impl Node {
     fn rect(&self) -> Rectangle {
         Rectangle::new(self.position, self.size)
+    }
+
+    /// Poignée de liaison, au bord droit de l'en-tête.
+    fn handle(&self) -> Point {
+        Point::new(self.position.x + self.size.width, self.position.y + HEADER_HEIGHT / 2.0)
     }
 
     fn center(&self) -> Point {
@@ -90,6 +112,8 @@ pub struct Diagram {
     pub nodes: Vec<Node>,
     pub relations: Vec<Relation>,
     pub mode: Mode,
+    /// Mode conception : tables et relations modifiables, poignées de liaison.
+    pub editable: bool,
     pub zoom: f32,
     pub offset: Vector,
     pub selected: Option<usize>,
@@ -114,7 +138,7 @@ impl Diagram {
             .map(|(table, columns)| {
                 let fks = fk_columns.get(&table);
                 let junction = is_junction(&columns, fks, relations.iter().filter(|r| r.from == table).count());
-                Node { table, columns, position: Point::ORIGIN, size: Size::ZERO, lines: Vec::new(), junction }
+                Node { table, columns, position: Point::ORIGIN, size: Size::ZERO, lines: Vec::new(), junction, existing: true }
             })
             .collect();
 
@@ -122,6 +146,7 @@ impl Diagram {
             nodes,
             relations,
             mode: Mode::Logical,
+            editable: false,
             zoom: 1.0,
             offset: Vector::ZERO,
             selected: None,
@@ -134,6 +159,306 @@ impl Diagram {
         diagram.set_mode(Mode::Logical);
         diagram.auto_layout();
         diagram
+    }
+
+    /// Diagramme vide, prêt à être dessiné.
+    pub fn empty() -> Self {
+        Self::new(Vec::new(), Vec::new())
+    }
+
+    /// Recalcule index, clés étrangères, jonctions et tailles après une
+    /// modification de structure.
+    fn refresh(&mut self) {
+        self.index = self.nodes.iter().enumerate().map(|(i, n)| (n.table.clone(), i)).collect();
+        self.fk_columns.clear();
+        for rel in &self.relations {
+            self.fk_columns.entry(rel.from.clone()).or_default().extend(rel.from_columns.iter().cloned());
+        }
+        for node in &mut self.nodes {
+            let outgoing = self.relations.iter().filter(|r| r.from == node.table).count();
+            node.junction = is_junction(&node.columns, self.fk_columns.get(&node.table), outgoing);
+        }
+        self.set_mode(self.mode);
+    }
+
+    // ------------------------------------------------------------------
+    // Mode conception
+    // ------------------------------------------------------------------
+
+    /// Ajoute une table vide (avec un `id` clé primaire) au centre de la vue
+    /// et la sélectionne. Renvoie son indice.
+    pub fn add_table(&mut self, schema: Option<String>, id_type: &str) -> usize {
+        let base = "nouvelle_table";
+        let mut name = base.to_string();
+        let mut n = 1;
+        while self.nodes.iter().any(|node| node.table.name == name) {
+            n += 1;
+            name = format!("{base}_{n}");
+        }
+        let view = self.viewport.get();
+        let center = self.to_world(Point::new(view.width / 2.0, view.height / 2.0));
+        let offset = self.nodes.len() as f32 * 24.0 % 160.0;
+        self.nodes.push(Node {
+            table: TableRef { schema, name },
+            columns: vec![ColumnInfo {
+                name: "id".into(),
+                data_type: id_type.into(),
+                nullable: false,
+                default: None,
+                primary_key: true,
+            }],
+            position: Point::new(center.x - 80.0 + offset, center.y - 40.0 + offset),
+            size: Size::ZERO,
+            lines: Vec::new(),
+            junction: false,
+            existing: false,
+        });
+        self.selected = Some(self.nodes.len() - 1);
+        self.refresh();
+        self.nodes.len() - 1
+    }
+
+    pub fn remove_table(&mut self, index: usize) {
+        if index >= self.nodes.len() {
+            return;
+        }
+        let table = self.nodes.remove(index).table;
+        self.relations.retain(|r| r.from != table && r.to != table);
+        self.selected = None;
+        self.refresh();
+    }
+
+    pub fn rename_table(&mut self, index: usize, name: &str) {
+        let Some(node) = self.nodes.get_mut(index) else { return };
+        let old = node.table.clone();
+        node.table.name = name.to_string();
+        let new = node.table.clone();
+        for rel in &mut self.relations {
+            if rel.from == old {
+                rel.from = new.clone();
+            }
+            if rel.to == old {
+                rel.to = new.clone();
+            }
+        }
+        self.refresh();
+    }
+
+    /// Modifie une colonne ; `f` reçoit la colonne. Les relations suivent
+    /// un renommage.
+    pub fn edit_column(&mut self, index: usize, column: usize, f: impl FnOnce(&mut ColumnInfo)) {
+        let Some(node) = self.nodes.get_mut(index) else { return };
+        let Some(col) = node.columns.get_mut(column) else { return };
+        let old = col.name.clone();
+        f(col);
+        let new = col.name.clone();
+        if old != new {
+            let table = node.table.clone();
+            for rel in &mut self.relations {
+                if rel.from == table {
+                    for c in &mut rel.from_columns {
+                        if *c == old {
+                            *c = new.clone();
+                        }
+                    }
+                }
+                if rel.to == table {
+                    for c in &mut rel.to_columns {
+                        if *c == old {
+                            *c = new.clone();
+                        }
+                    }
+                }
+            }
+        }
+        self.refresh();
+    }
+
+    pub fn add_column(&mut self, index: usize) {
+        let Some(node) = self.nodes.get_mut(index) else { return };
+        node.columns.push(ColumnInfo {
+            name: String::new(),
+            data_type: String::new(),
+            nullable: true,
+            default: None,
+            primary_key: false,
+        });
+        self.refresh();
+    }
+
+    pub fn remove_column(&mut self, index: usize, column: usize) {
+        let Some(node) = self.nodes.get_mut(index) else { return };
+        if column >= node.columns.len() {
+            return;
+        }
+        let name = node.columns.remove(column).name;
+        let table = node.table.clone();
+        self.relations.retain(|r| {
+            !(r.from == table && r.from_columns.contains(&name)) && !(r.to == table && r.to_columns.contains(&name))
+        });
+        self.refresh();
+    }
+
+    pub fn remove_relation(&mut self, index: usize) {
+        if index < self.relations.len() {
+            self.relations.remove(index);
+            self.refresh();
+        }
+    }
+
+    /// Crée une relation entre deux tables en ajoutant ce qu'il faut : la
+    /// clé étrangère côté « plusieurs », ou une table de jonction.
+    pub fn link(&mut self, from: usize, to: usize, kind: LinkKind) -> Result<(), String> {
+        if from == to {
+            return Err("Une table ne peut pas être liée à elle-même ici".into());
+        }
+        let pk_of = |node: &Node| -> Result<(String, String), String> {
+            node.columns
+                .iter()
+                .find(|c| c.primary_key)
+                .map(|c| (c.name.clone(), c.data_type.clone()))
+                .ok_or_else(|| format!("La table {} n'a pas de clé primaire", node.table.name))
+        };
+
+        match kind {
+            LinkKind::OneToMany | LinkKind::ManyToOne => {
+                // La clé étrangère va dans la table « plusieurs ».
+                let (one, many) = if kind == LinkKind::OneToMany { (from, to) } else { (to, from) };
+                let (pk_name, pk_type) = pk_of(&self.nodes[one])?;
+                let fk_name = format!("{}_{pk_name}", singular(&self.nodes[one].table.name));
+                let fk_type = reference_type(&pk_type);
+                let many_table = self.nodes[many].table.clone();
+                let one_table = self.nodes[one].table.clone();
+                if !self.nodes[many].columns.iter().any(|c| c.name == fk_name) {
+                    self.nodes[many].columns.push(ColumnInfo {
+                        name: fk_name.clone(),
+                        data_type: fk_type,
+                        nullable: false,
+                        default: None,
+                        primary_key: false,
+                    });
+                }
+                self.relations.push(Relation {
+                    from: many_table,
+                    from_columns: vec![fk_name],
+                    to: one_table,
+                    to_columns: vec![pk_name],
+                });
+            }
+            LinkKind::ManyToMany => {
+                let (a_pk, a_type) = pk_of(&self.nodes[from])?;
+                let (b_pk, b_type) = pk_of(&self.nodes[to])?;
+                let (a, b) = (self.nodes[from].table.clone(), self.nodes[to].table.clone());
+                let a_fk = format!("{}_{a_pk}", singular(&a.name));
+                let b_fk = format!("{}_{b_pk}", singular(&b.name));
+                let junction = TableRef { schema: a.schema.clone(), name: format!("{}_{}", singular(&a.name), b.name) };
+                let mid = Point::new(
+                    (self.nodes[from].position.x + self.nodes[to].position.x) / 2.0,
+                    (self.nodes[from].position.y + self.nodes[to].position.y) / 2.0 + 120.0,
+                );
+                let fk = |name: String, data_type: String| ColumnInfo {
+                    name,
+                    data_type: reference_type(&data_type),
+                    nullable: false,
+                    default: None,
+                    primary_key: true,
+                };
+                self.nodes.push(Node {
+                    table: junction.clone(),
+                    columns: vec![fk(a_fk.clone(), a_type), fk(b_fk.clone(), b_type)],
+                    position: mid,
+                    size: Size::ZERO,
+                    lines: Vec::new(),
+                    junction: true,
+                    existing: false,
+                });
+                self.relations.push(Relation { from: junction.clone(), from_columns: vec![a_fk], to: a, to_columns: vec![a_pk] });
+                self.relations.push(Relation { from: junction, from_columns: vec![b_fk], to: b, to_columns: vec![b_pk] });
+            }
+        }
+        self.refresh();
+        Ok(())
+    }
+
+    /// Script de création des tables **nouvelles** (pas celles déjà en
+    /// base), dans un ordre qui respecte les clés étrangères.
+    pub fn to_ddl(&self, c: &dyn Connector) -> Result<String, String> {
+        let new: Vec<usize> = (0..self.nodes.len()).filter(|&i| !self.nodes[i].existing).collect();
+        if new.is_empty() {
+            return Err("Aucune nouvelle table : ajoute des tables au diagramme".into());
+        }
+        for &i in &new {
+            let node = &self.nodes[i];
+            if node.table.name.trim().is_empty() {
+                return Err("Une table n'a pas de nom".into());
+            }
+            for col in &node.columns {
+                if col.name.trim().is_empty() || col.data_type.trim().is_empty() {
+                    return Err(format!("La table {} a une colonne sans nom ou sans type", node.table.name));
+                }
+            }
+        }
+
+        // Tri topologique : une table après celles qu'elle référence.
+        let mut order: Vec<usize> = Vec::new();
+        let mut remaining: Vec<usize> = new.clone();
+        while !remaining.is_empty() {
+            let before = remaining.len();
+            remaining.retain(|&i| {
+                let table = &self.nodes[i].table;
+                let blocked = self.relations.iter().any(|r| {
+                    r.from == *table
+                        && r.to != *table
+                        && self.index.get(&r.to).is_some_and(|&j| !self.nodes[j].existing && !order.contains(&j))
+                });
+                if blocked { true } else { order.push(i); false }
+            });
+            if remaining.len() == before {
+                // Cycle : on prend ce qui reste tel quel.
+                order.extend(remaining.drain(..));
+            }
+        }
+
+        let mut statements = Vec::new();
+        for i in order {
+            let node = &self.nodes[i];
+            let columns: Vec<ColumnDef> = node
+                .columns
+                .iter()
+                .map(|col| ColumnDef {
+                    name: col.name.trim().into(),
+                    data_type: col.data_type.trim().into(),
+                    nullable: col.nullable,
+                    primary_key: col.primary_key,
+                })
+                .collect();
+            let mut sql = c.create_table_sql(&node.table, &columns);
+            let fks: Vec<String> = self
+                .relations
+                .iter()
+                .filter(|r| r.from == node.table)
+                .map(|r| {
+                    format!(
+                        "    FOREIGN KEY ({}) REFERENCES {} ({})",
+                        r.from_columns.iter().map(|col| c.quote_identifier(col)).collect::<Vec<_>>().join(", "),
+                        c.quote_table(&r.to),
+                        r.to_columns.iter().map(|col| c.quote_identifier(col)).collect::<Vec<_>>().join(", ")
+                    )
+                })
+                .collect();
+            if !fks.is_empty() {
+                // Insère les contraintes avant la parenthèse fermante.
+                let end = sql.rfind("
+)").unwrap_or(sql.len());
+                sql.insert_str(end, &format!(",
+{}", fks.join(",
+")));
+            }
+            statements.push(sql + ";");
+        }
+        Ok(statements.join("
+
+"))
     }
 
     pub fn set_mode(&mut self, mode: Mode) {
@@ -169,6 +494,8 @@ impl Diagram {
                 self.zoom = zoom;
             }
             Interaction::Select(index) => self.selected = index,
+            // La liaison demande un choix (1-n, n-1, n-n) : l'application s'en charge.
+            Interaction::Link { .. } => {}
         }
         self.cache.clear();
     }
@@ -259,6 +586,14 @@ impl Diagram {
         Point::new((screen.x - self.offset.x) / self.zoom, (screen.y - self.offset.y) / self.zoom)
     }
 
+    fn handle_at(&self, world: Point) -> Option<usize> {
+        self.nodes.iter().rposition(|n| {
+            let h = n.handle();
+            let d = world - h;
+            (d.x * d.x + d.y * d.y).sqrt() <= HANDLE_RADIUS * 2.0 / self.zoom.max(0.5)
+        })
+    }
+
     fn node_at(&self, world: Point) -> Option<usize> {
         // Le dernier dessiné est au-dessus : on cherche en partant de la fin.
         self.nodes.iter().rposition(|n| n.rect().contains(world))
@@ -304,6 +639,12 @@ impl Diagram {
             align_y: alignment::Vertical::Center,
             ..Text::default()
         });
+
+        if self.editable {
+            let handle = Path::circle(node.handle(), HANDLE_RADIUS);
+            frame.fill(&handle, if node.existing { theme::MUTED } else { theme::SUCCESS });
+            frame.stroke(&handle, Stroke::default().with_color(theme::BACKGROUND).with_width(1.5));
+        }
 
         for (i, line) in node.lines.iter().enumerate() {
             let y = rect.y + HEADER_HEIGHT + PADDING / 2.0 + i as f32 * ROW_HEIGHT + ROW_HEIGHT / 2.0;
@@ -438,6 +779,8 @@ pub struct State {
 enum Drag {
     Node { index: usize, grab: Vector },
     Pan { last: Point },
+    /// Trait élastique depuis la poignée de `from` jusqu'au curseur (écran).
+    Link { from: usize, cursor: Point },
 }
 
 impl canvas::Program<Interaction> for Diagram {
@@ -457,6 +800,12 @@ impl canvas::Program<Interaction> for Diagram {
             mouse::Event::ButtonPressed(mouse::Button::Left) => {
                 let screen = position?;
                 let world = self.to_world(screen);
+                if self.editable
+                    && let Some(from) = self.handle_at(world)
+                {
+                    state.drag = Some(Drag::Link { from, cursor: screen });
+                    return Some(canvas::Action::publish(Interaction::Select(Some(from))).and_capture());
+                }
                 state.drag = Some(match self.node_at(world) {
                     Some(index) => Drag::Node { index, grab: world - self.nodes[index].position },
                     None => Drag::Pan { last: screen },
@@ -478,10 +827,21 @@ impl canvas::Program<Interaction> for Diagram {
                         state.drag = Some(Drag::Pan { last: screen });
                         Some(canvas::Action::publish(Interaction::Pan(screen - last)).and_capture())
                     }
+                    Drag::Link { from, .. } => {
+                        state.drag = Some(Drag::Link { from, cursor: screen });
+                        Some(canvas::Action::request_redraw().and_capture())
+                    }
                 }
             }
             mouse::Event::ButtonReleased(mouse::Button::Left) => {
-                state.drag = None;
+                let drag = state.drag.take();
+                if let Some(Drag::Link { from, .. }) = drag
+                    && let Some(screen) = position
+                    && let Some(to) = self.node_at(self.to_world(screen))
+                    && to != from
+                {
+                    return Some(canvas::Action::publish(Interaction::Link { from, to }).and_capture());
+                }
                 Some(canvas::Action::request_redraw())
             }
             mouse::Event::WheelScrolled { delta } => {
@@ -499,25 +859,68 @@ impl canvas::Program<Interaction> for Diagram {
 
     fn draw(
         &self,
-        _state: &State,
+        state: &State,
         renderer: &iced::Renderer,
         _theme: &iced::Theme,
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
         self.viewport.set(bounds.size());
-        vec![self.cache.draw(renderer, bounds.size(), |frame| self.draw_all(frame))]
+        let mut layers = vec![self.cache.draw(renderer, bounds.size(), |frame| self.draw_all(frame))];
+        // Trait élastique pendant une liaison : hors cache, il bouge à chaque image.
+        if let Some(Drag::Link { from, cursor }) = state.drag
+            && let Some(node) = self.nodes.get(from)
+        {
+            let mut frame = Frame::new(renderer, bounds.size());
+            let start = Point::new(
+                node.handle().x * self.zoom + self.offset.x,
+                node.handle().y * self.zoom + self.offset.y,
+            );
+            frame.stroke(
+                &Path::line(start, cursor),
+                Stroke::default().with_color(theme::SUCCESS).with_width(2.0),
+            );
+            frame.fill(&Path::circle(cursor, 4.0), theme::SUCCESS);
+            layers.push(frame.into_geometry());
+        }
+        layers
     }
 
     fn mouse_interaction(&self, state: &State, bounds: Rectangle, cursor: mouse::Cursor) -> mouse::Interaction {
         match state.drag {
             Some(Drag::Node { .. }) => mouse::Interaction::Grabbing,
             Some(Drag::Pan { .. }) => mouse::Interaction::Move,
+            Some(Drag::Link { .. }) => mouse::Interaction::Crosshair,
             None => match cursor.position_in(bounds) {
+                Some(p) if self.editable && self.handle_at(self.to_world(p)).is_some() => mouse::Interaction::Crosshair,
                 Some(p) if self.node_at(self.to_world(p)).is_some() => mouse::Interaction::Grab,
                 _ => mouse::Interaction::default(),
             },
         }
+    }
+}
+
+/// `users` → `user`, `categories` → `category` : pour nommer `user_id`.
+fn singular(name: &str) -> String {
+    if let Some(stem) = name.strip_suffix("ies") {
+        format!("{stem}y")
+    } else if name.ends_with("ss") {
+        name.to_string()
+    } else if let Some(stem) = name.strip_suffix('s') {
+        stem.to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+/// Type d'une clé étrangère d'après celui de la clé référencée : un
+/// auto-incrément devient l'entier correspondant.
+fn reference_type(pk_type: &str) -> String {
+    match pk_type.to_uppercase().as_str() {
+        "SERIAL" => "INTEGER".into(),
+        "BIGSERIAL" => "BIGINT".into(),
+        "SMALLSERIAL" => "SMALLINT".into(),
+        _ => pk_type.to_string(),
     }
 }
 
@@ -537,6 +940,45 @@ mod tests {
         // Une clé propre en fait une entité, pas une association.
         let cols = [col("id", true), col("user_id", false), col("badge_id", false)];
         assert!(!is_junction(&cols, Some(&fks), 2));
+    }
+
+    #[test]
+    fn singular_forms() {
+        assert_eq!(singular("users"), "user");
+        assert_eq!(singular("categories"), "category");
+        assert_eq!(singular("courses"), "course");
+        assert_eq!(singular("address"), "address");
+    }
+
+    #[test]
+    fn one_to_many_adds_foreign_key() {
+        let mut d = Diagram::empty();
+        let users = d.add_table(None, "SERIAL");
+        d.rename_table(users, "users");
+        let orders = d.add_table(None, "SERIAL");
+        d.rename_table(orders, "orders");
+        d.link(users, orders, LinkKind::OneToMany).unwrap();
+
+        let fk = d.nodes[orders].columns.iter().find(|c| c.name == "user_id").expect("user_id ajouté");
+        assert_eq!(fk.data_type, "INTEGER");
+        assert_eq!(d.relations.len(), 1);
+        assert_eq!(d.relations[0].from.name, "orders");
+        assert_eq!(d.relations[0].to.name, "users");
+    }
+
+    #[test]
+    fn many_to_many_creates_junction() {
+        let mut d = Diagram::empty();
+        let a = d.add_table(None, "INTEGER");
+        d.rename_table(a, "students");
+        let b = d.add_table(None, "INTEGER");
+        d.rename_table(b, "courses");
+        d.link(a, b, LinkKind::ManyToMany).unwrap();
+        assert_eq!(d.nodes.len(), 3);
+        let j = &d.nodes[2];
+        assert_eq!(j.table.name, "student_courses");
+        assert!(j.junction);
+        assert_eq!(d.relations.len(), 2);
     }
 
     #[test]
