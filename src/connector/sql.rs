@@ -177,6 +177,23 @@ impl Connector for SqlConnector {
         }
     }
 
+    fn create_schema_sql(&self, name: &str) -> Option<String> {
+        match self {
+            // MySQL : un schéma est une base.
+            Self::MySql(_) => Some(format!("CREATE DATABASE {}", self.quote_identifier(name))),
+            Self::Sqlite(_) => None,
+            Self::Postgres(_) => Some(format!("CREATE SCHEMA {}", self.quote_identifier(name))),
+        }
+    }
+
+    fn drop_schema_sql(&self, name: &str) -> Option<String> {
+        match self {
+            Self::MySql(_) => Some(format!("DROP DATABASE {}", self.quote_identifier(name))),
+            Self::Sqlite(_) => None,
+            Self::Postgres(_) => Some(format!("DROP SCHEMA {}", self.quote_identifier(name))),
+        }
+    }
+
     fn alter_table_sql(&self, table: &TableRef, alter: &Alter) -> String {
         match (self, alter) {
             // MySQL < 8 : RENAME COLUMN n'existe pas ; CHANGE exige le type,
@@ -554,6 +571,7 @@ mod tests {
     async fn sqlite_has_no_schemas() {
         let c = demo().await;
         assert!(c.list_schemas().await.unwrap().is_empty());
+        assert!(c.create_schema_sql("x").is_none());
     }
 
     /// Test d'intégration PostgreSQL, joué seulement si `QUARRY_TEST_PG`
@@ -570,7 +588,7 @@ mod tests {
         let c = SqlConnector::Postgres(pool);
         let schema = format!("quarry_test_{}", std::process::id());
 
-        c.execute(&format!("CREATE SCHEMA \"{schema}\"")).await.unwrap();
+        c.execute(&c.create_schema_sql(&schema).unwrap()).await.unwrap();
         assert!(c.list_schemas().await.unwrap().contains(&schema), "schéma vide absent de list_schemas");
 
         let table = TableRef { schema: Some(schema.clone()), name: "t".into() };

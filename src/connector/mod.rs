@@ -249,6 +249,16 @@ pub trait Connector: Send + Sync + fmt::Debug {
         format!("CREATE TABLE {} (\n{}\n)", self.quote_table(table), lines.join(",\n"))
     }
 
+    /// `None` si le moteur n'a pas de schémas (SQLite).
+    fn create_schema_sql(&self, name: &str) -> Option<String> {
+        Some(format!("CREATE SCHEMA {}", self.quote_identifier(name)))
+    }
+
+    /// Refuse de supprimer un schéma non vide (pas de CASCADE) : c'est volontaire.
+    fn drop_schema_sql(&self, name: &str) -> Option<String> {
+        Some(format!("DROP SCHEMA {}", self.quote_identifier(name)))
+    }
+
     fn drop_table_sql(&self, table: &TableRef) -> String {
         format!("DROP TABLE {}", self.quote_table(table))
     }

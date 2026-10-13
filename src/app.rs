@@ -1886,6 +1886,26 @@ impl App {
     // `None` : l'action ne s'applique pas dans l'état courant.
     // ------------------------------------------------------------------
 
+    fn dialog_new_schema(&self) -> Option<Dialog> {
+        let c = self.connector()?;
+        c.create_schema_sql("x")?;
+        Some(Dialog::Schema(editing::SchemaForm { name: String::new() }))
+    }
+
+    /// Supprime le schéma de la table sélectionnée (vide uniquement).
+    fn dialog_drop_schema(&self) -> Option<Dialog> {
+        let c = self.connector()?;
+        let schema = self.selected.as_ref()?.schema.clone()?;
+        let sql = c.drop_schema_sql(&schema)?;
+        Some(Dialog::Confirm(editing::Pending {
+            title: format!("Supprimer le schéma {schema} (doit être vide)"),
+            sql,
+            refresh: Refresh::Structure,
+            select: None,
+            extra: Vec::new(),
+        }))
+    }
+
     fn dialog_new_table(&self) -> Option<Dialog> {
         let session = self.session.as_ref()?;
         let config = self.active_config()?;
@@ -2002,6 +2022,9 @@ impl App {
 
         let menu = column![
             container(text(table_name).size(12).color(theme::PRIMARY)).padding([6, 12]),
+            section("SCHÉMAS"),
+            item("Nouveau schéma…", self.dialog_new_schema(), false),
+            item("Supprimer le schéma de la table sélectionnée…", self.dialog_drop_schema(), true),
             section("TABLE"),
             item("Nouvelle table…", self.dialog_new_table(), false),
             item("Renommer la table…", self.dialog_rename_table(), false),

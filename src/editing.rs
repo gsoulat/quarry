@@ -318,8 +318,32 @@ impl RenameForm {
     }
 }
 
+/// Création d'un schéma (ou base MySQL, dataset BigQuery).
+#[derive(Debug, Clone)]
+pub struct SchemaForm {
+    pub name: String,
+}
+
+impl SchemaForm {
+    pub fn to_sql(&self, c: &dyn Connector) -> Result<Pending, String> {
+        let name = self.name.trim();
+        if name.is_empty() {
+            return Err("Nom du schéma manquant".into());
+        }
+        let sql = c.create_schema_sql(name).ok_or("Ce moteur n'a pas de schémas")?;
+        Ok(Pending {
+            title: format!("Créer le schéma {name}"),
+            sql,
+            refresh: Refresh::Structure,
+            select: None,
+            extra: Vec::new(),
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Dialog {
+    Schema(SchemaForm),
     Row(RowForm),
     Table(TableForm),
     Column(ColumnForm),
@@ -343,6 +367,7 @@ pub enum DialogMessage {
     AddColumnRow,
     RemoveColumnRow(usize),
     RenameTo(String),
+    SchemaName(String),
     /// Génère le SQL et passe à la confirmation.
     Submit,
     /// Exécute le SQL confirmé.
@@ -383,12 +408,14 @@ impl Dialog {
             (Dialog::Column(f), M::ColumnType(_, v)) => f.draft.data_type = v,
             (Dialog::Column(f), M::ColumnNullable(_, v)) => f.draft.nullable = v,
             (Dialog::Rename(f), M::RenameTo(v)) => f.to = v,
+            (Dialog::Schema(f), M::SchemaName(v)) => f.name = v,
             _ => {}
         }
     }
 
     pub fn to_sql(&self, c: &dyn Connector) -> Result<Pending, String> {
         match self {
+            Dialog::Schema(f) => f.to_sql(c),
             Dialog::Row(f) => f.to_sql(c),
             Dialog::Table(f) => f.to_sql(c),
             Dialog::Column(f) => f.to_sql(c),
@@ -428,6 +455,7 @@ pub fn view<'a>(dialog: &'a Dialog, error: Option<&'a str>, engine: Engine) -> E
             rename_form(f),
             "Voir le SQL",
         ),
+        Dialog::Schema(f) => ("Nouveau schéma".into(), schema_form(f), "Voir le SQL"),
         Dialog::Confirm(p) => (p.title.clone(), confirm_view(p), "Exécuter"),
     };
 
@@ -648,6 +676,19 @@ fn column_form(f: &ColumnForm, engine: Engine) -> Element<'_, Message> {
         column_rows(std::slice::from_ref(&f.draft), false, engine),
     ]
     .spacing(12)
+    .into()
+}
+
+fn schema_form(f: &SchemaForm) -> Element<'_, Message> {
+    column![
+        label("Nom du schéma (base pour MySQL, dataset pour BigQuery)"),
+        text_input("ventes", &f.name)
+            .on_input(|v| Message::Dialog(DialogMessage::SchemaName(v)))
+            .font(MONO)
+            .size(13)
+            .padding(6),
+    ]
+    .spacing(4)
     .into()
 }
 
