@@ -24,8 +24,9 @@ jobs:
             os: macos-14
             target: aarch64-apple-darwin
             archive: Quarry-${{ github.ref_name }}-macos-apple-silicon.zip
+          # Compilé en croisé depuis le runner Apple Silicon (macos-13 n'existe plus).
           - name: macOS (Intel)
-            os: macos-13
+            os: macos-14
             target: x86_64-apple-darwin
             archive: Quarry-${{ github.ref_name }}-macos-intel.zip
           - name: Linux (x86_64)
