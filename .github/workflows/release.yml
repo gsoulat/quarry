@@ -1,0 +1,104 @@
+# Construit Quarry pour macOS, Linux et Windows et attache les archives à
+# la Release GitHub du tag. Déclenchement : `git tag v0.1.0 && git push --tags`.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS (Apple Silicon)
+            os: macos-14
+            target: aarch64-apple-darwin
+            archive: Quarry-${{ github.ref_name }}-macos-apple-silicon.zip
+          - name: macOS (Intel)
+            os: macos-13
+            target: x86_64-apple-darwin
+            archive: Quarry-${{ github.ref_name }}-macos-intel.zip
+          - name: Linux (x86_64)
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            archive: Quarry-${{ github.ref_name }}-linux-x86_64.tar.gz
+          - name: Windows (x86_64)
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: Quarry-${{ github.ref_name }}-windows-x86_64.zip
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Dépendances Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
+
+      - name: Compilation
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # macOS : une vraie application Quarry.app avec son icône.
+      - name: Bundle macOS
+        if: runner.os == 'macOS'
+        run: |
+          cargo install cargo-bundle --locked
+          cargo bundle --release --target ${{ matrix.target }}
+          cd target/${{ matrix.target }}/release/bundle/osx
+          ditto -c -k --keepParent Quarry.app "${{ matrix.archive }}"
+          mv "${{ matrix.archive }}" "$GITHUB_WORKSPACE/"
+
+      - name: Archive Linux
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist/quarry
+          cp target/${{ matrix.target }}/release/quarry dist/quarry/
+          cp README.md assets/icon.png dist/quarry/
+          tar -C dist -czf "${{ matrix.archive }}" quarry
+
+      - name: Archive Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/quarry.exe dist/Quarry.exe
+          Copy-Item README.md dist/
+          Compress-Archive -Path dist/* -DestinationPath "${{ matrix.archive }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+
+  release:
+    name: Publier la Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          body: |
+            ## Installation
+
+            - **macOS** : dézippe, glisse `Quarry.app` dans Applications. L'application n'est pas signée par Apple :
+              au premier lancement, clic droit → Ouvrir (ou Réglages → Confidentialité et sécurité → Ouvrir quand même).
+            - **Linux** : `tar xzf` puis lance `./quarry`.
+            - **Windows** : dézippe et lance `Quarry.exe`. SmartScreen peut demander confirmation (exécutable non signé).
