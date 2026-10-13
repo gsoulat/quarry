@@ -26,6 +26,16 @@ Client de bases de données léger et multiplateforme (macOS, Linux, Windows), �
 
 Chaque moteur a sa propre échelle de coût : les valeurs ne sont pas comparables d'un moteur à l'autre.
 
+## Installer
+
+Les exécutables pour macOS (Apple Silicon et Intel), Linux et Windows sont sur la page [Releases](https://github.com/gsoulat/quarry/releases). Ils sont construits par GitHub Actions à chaque tag `v*` ; voir `.github/workflows/release.yml`.
+
+Pour publier une version :
+
+```bash
+git tag v0.1.0 && git push --tags
+```
+
 ## Lancer
 
 ```bash
