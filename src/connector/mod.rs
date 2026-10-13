@@ -254,6 +254,11 @@ pub trait Connector: Send + Sync + fmt::Debug {
 
     async fn list_tables(&self) -> Result<Vec<TableRef>>;
 
+    /// Schémas (ou datasets) existants, même vides. Vide si le moteur n'en a pas.
+    async fn list_schemas(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     async fn describe_table(&self, table: &TableRef) -> Result<Vec<ColumnInfo>>;
 
     /// Toutes les clés étrangères de la base, pour le diagramme.

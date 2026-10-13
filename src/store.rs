@@ -120,9 +120,18 @@ impl ConnectionConfig {
     }
 }
 
-fn config_file() -> Option<PathBuf> {
+/// Dossier de configuration. `QUARRY_CONFIG_DIR` le remplace (tests,
+/// profils séparés).
+fn config_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("QUARRY_CONFIG_DIR") {
+        return Some(PathBuf::from(dir));
+    }
     let dirs = directories::ProjectDirs::from("fr", "gsoulat", "Quarry")?;
-    Some(dirs.config_dir().join("connections.json"))
+    Some(dirs.config_dir().to_path_buf())
+}
+
+fn config_file() -> Option<PathBuf> {
+    Some(config_dir()?.join("connections.json"))
 }
 
 /// Charge les connexions ; un fichier absent donne une liste vide.
@@ -189,8 +198,7 @@ pub struct HistoryEntry {
 const HISTORY_MAX: usize = 200;
 
 fn per_connection_file(kind: &str, id: u64) -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("fr", "gsoulat", "Quarry")?;
-    Some(dirs.config_dir().join(kind).join(format!("{id}.json")))
+    Some(config_dir()?.join(kind).join(format!("{id}.json")))
 }
 
 fn read_json<T: serde::de::DeserializeOwned + Default>(path: Option<PathBuf>) -> T {
@@ -227,4 +235,79 @@ pub fn push_history(connection: u64, entry: HistoryEntry) -> Result<Vec<HistoryE
     history.truncate(HISTORY_MAX);
     write_json(per_connection_file("history", connection), &history)?;
     Ok(history)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Chaque test écrit dans son propre dossier temporaire.
+    fn with_temp_config<T>(name: &str, f: impl FnOnce() -> T) -> T {
+        let dir = std::env::temp_dir().join(format!("quarry-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // SAFETY : les tests de ce module tournent en série (voir `serial`).
+        unsafe { std::env::set_var("QUARRY_CONFIG_DIR", &dir) };
+        let result = f();
+        unsafe { std::env::remove_var("QUARRY_CONFIG_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+        result
+    }
+
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn queries_round_trip_per_connection() {
+        let _guard = SERIAL.lock().unwrap();
+        with_temp_config("queries", || {
+            assert!(load_queries(7).is_empty());
+            let queries = vec![
+                SavedQuery { name: "Clients".into(), sql: "SELECT * FROM clients".into() },
+                SavedQuery { name: "Brouillon".into(), sql: String::new() },
+            ];
+            save_queries(7, &queries).unwrap();
+            let loaded = load_queries(7);
+            assert_eq!(loaded.len(), 2);
+            assert_eq!(loaded[0].name, "Clients");
+            assert_eq!(loaded[1].sql, "");
+            // Une autre connexion ne voit pas ces onglets.
+            assert!(load_queries(8).is_empty());
+        });
+    }
+
+    #[test]
+    fn history_is_newest_first_and_bounded() {
+        let _guard = SERIAL.lock().unwrap();
+        with_temp_config("history", || {
+            for i in 0..(HISTORY_MAX + 5) {
+                push_history(1, HistoryEntry { sql: format!("SELECT {i}"), at: "t".into(), rows: 1, ms: 1 }).unwrap();
+            }
+            let history = load_history(1);
+            assert_eq!(history.len(), HISTORY_MAX);
+            assert_eq!(history[0].sql, format!("SELECT {}", HISTORY_MAX + 4));
+        });
+    }
+
+    #[test]
+    fn connections_survive_a_reload() {
+        let _guard = SERIAL.lock().unwrap();
+        with_temp_config("connections", || {
+            assert!(load().unwrap().is_empty());
+            let config = ConnectionConfig {
+                id: 1,
+                name: "Local".into(),
+                engine: Engine::Postgres,
+                folder: "Perso".into(),
+                host: "localhost".into(),
+                port: Some(5432),
+                user: "me".into(),
+                database: "app".into(),
+                path: String::new(),
+                project_id: String::new(),
+                credentials_path: String::new(),
+            };
+            save(std::slice::from_ref(&config)).unwrap();
+            let loaded = load().unwrap();
+            assert_eq!(loaded, vec![config]);
+        });
+    }
 }

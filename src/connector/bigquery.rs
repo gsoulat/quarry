@@ -123,6 +123,16 @@ impl Connector for BigQueryConnector {
         Ok(tables)
     }
 
+    async fn list_schemas(&self) -> Result<Vec<String>> {
+        let datasets = self
+            .client
+            .dataset()
+            .list(&self.project_id, Default::default())
+            .await
+            .map_err(err)?;
+        Ok(datasets.datasets.into_iter().map(|d| d.dataset_reference.dataset_id).collect())
+    }
+
     async fn describe_table(&self, table: &TableRef) -> Result<Vec<ColumnInfo>> {
         let dataset = table.schema.as_deref().ok_or("Dataset manquant")?;
         let info = self

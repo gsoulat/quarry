@@ -98,6 +98,7 @@ struct Session {
     id: u64,
     connector: Arc<dyn Connector>,
     tables: Vec<TableRef>,
+    schemas: Vec<String>,
 }
 
 pub struct App {
@@ -143,6 +144,7 @@ pub enum Message {
     Connected(u64, Result<Arc<dyn Connector>>),
     Disconnect,
     TablesLoaded(Result<Vec<TableRef>>),
+    SchemasLoaded(Result<Vec<String>>),
     TableSelected(TableRef),
     InsertTable(TableRef),
     SchemaLoaded(Result<Vec<ColumnInfo>>),
@@ -308,6 +310,16 @@ impl App {
         editor.selection().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| editor.text())
     }
 
+    /// Recharge la liste des tables et des schémas de la connexion ouverte.
+    fn reload_structure(&mut self) -> Task<Message> {
+        let Some(c) = self.connector() else { return Task::none() };
+        let c2 = c.clone();
+        Task::batch([
+            Task::perform(async move { c.list_tables().await }, Message::TablesLoaded),
+            Task::perform(async move { c2.list_schemas().await }, Message::SchemasLoaded),
+        ])
+    }
+
     /// Ouvre un onglet et l'active.
     fn open_tab(&mut self, name: String, sql: &str) {
         let id = self.next_tab_id;
@@ -354,7 +366,7 @@ impl App {
                 self.connecting = None;
                 self.status = Status::Info(format!("Connecté ({})", c.engine()));
                 self.persist_tabs();
-                self.session = Some(Session { id, connector: c.clone(), tables: Vec::new() });
+                self.session = Some(Session { id, connector: c.clone(), tables: Vec::new(), schemas: Vec::new() });
                 self.load_tabs(id);
                 self.selected = None;
                 self.schema.clear();
@@ -363,7 +375,7 @@ impl App {
                 self.diagram = None;
                 self.data = None;
                 self.data_table = None;
-                return Task::perform(async move { c.list_tables().await }, Message::TablesLoaded);
+                return self.reload_structure();
             }
             Message::Connected(_, Err(e)) => {
                 self.connecting = None;
@@ -380,9 +392,18 @@ impl App {
                 self.data_table = None;
                 self.status = Status::Idle;
             }
+            Message::SchemasLoaded(Ok(schemas)) => {
+                if let Some(session) = &mut self.session {
+                    session.schemas = schemas;
+                }
+            }
             Message::TablesLoaded(Ok(tables)) => {
                 if let Some(session) = &mut self.session {
                     session.tables = tables;
+                }
+                // Diagramme ouvert : on le recharge avec la nouvelle structure.
+                if self.tab == Tab::Diagram && self.diagram.is_none() && !self.diagram_loading {
+                    return self.update(Message::LoadDiagram);
                 }
                 // Table sélectionnée encore présente : on relit son schéma
                 // (et ses lignes si l'onglet Données est ouvert).
@@ -402,10 +423,8 @@ impl App {
                     // On ne détruit pas une requête en cours : l'aperçu remplace
                     // l'onglet actif seulement s'il est vide ou déjà un aperçu.
                     let current = self.tab().editor.text();
-                    let is_preview = current.trim().is_empty()
-                        || (current.starts_with("SELECT * FROM") && current.lines().count() == 1);
                     let sql = c.preview_sql(&table);
-                    if is_preview {
+                    if is_preview_sql(&current) {
                         self.tab_mut().editor = text_editor::Content::with_text(&sql);
                     } else {
                         self.open_tab(table.name.clone(), &sql);
@@ -538,7 +557,8 @@ impl App {
                         self.data = None;
                         self.data_table = None;
                         self.diagram = None;
-                        Task::perform(async move { c.list_tables().await }, Message::TablesLoaded)
+                        let _ = c;
+                        self.reload_structure()
                     }
                 };
             }
@@ -733,12 +753,19 @@ impl App {
                         Err(e) => self.status = Status::Error(e),
                     }
                 }
+                let is_ddl = is_ddl(&sql);
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
                     tab.result = Some(result);
                     tab.result_sql = Some(sql);
                     tab.page = 0;
                 }
                 self.tab = Tab::Results;
+                if is_ddl {
+                    // Une instruction de structure tapée à la main : la barre
+                    // latérale, le schéma et le diagramme doivent suivre.
+                    self.diagram = None;
+                    return self.reload_structure();
+                }
             }
             Message::QueryTabNew => {
                 let n = self.next_tab_id;
@@ -787,6 +814,7 @@ impl App {
             Message::KeyPressed(key, modifiers) => return self.handle_key(key, modifiers),
 
             Message::TablesLoaded(Err(e))
+            | Message::SchemasLoaded(Err(e))
             | Message::SchemaLoaded(Err(e))
             | Message::Explained(_, _, Err(e))
             | Message::QueryDone(_, _, Err(e), _) => self.status = Status::Error(e),
@@ -1452,9 +1480,12 @@ impl App {
     fn dialog_new_table(&self) -> Option<Dialog> {
         let session = self.session.as_ref()?;
         let config = self.active_config()?;
-        let mut schemas: Vec<String> = session.tables.iter().filter_map(|t| t.schema.clone()).collect();
-        schemas.sort_unstable();
-        schemas.dedup();
+        let mut schemas = session.schemas.clone();
+        if schemas.is_empty() {
+            schemas = session.tables.iter().filter_map(|t| t.schema.clone()).collect();
+            schemas.sort_unstable();
+            schemas.dedup();
+        }
         Some(Dialog::Table(TableForm::new(schemas, config.engine)))
     }
 
@@ -1831,6 +1862,21 @@ fn source_line(sql: Option<&str>) -> Element<'_, Message> {
         .into()
 }
 
+/// Instruction qui change la structure de la base : après son exécution,
+/// la liste des tables, des schémas et le diagramme doivent être relus.
+fn is_ddl(sql: &str) -> bool {
+    let head = sql.trim_start().to_uppercase();
+    ["CREATE", "DROP", "ALTER", "RENAME", "TRUNCATE"].iter().any(|k| head.starts_with(k))
+}
+
+/// Contenu d'onglet que l'on peut remplacer sans perte par l'aperçu d'une
+/// table : vide, ou un aperçu généré (`SELECT * FROM … LIMIT 100` sur une
+/// ligne). Tout le reste est une requête de l'utilisateur.
+fn is_preview_sql(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.is_empty() || (trimmed.starts_with("SELECT * FROM") && trimmed.lines().count() == 1)
+}
+
 /// Bouton d'action d'un onglet : grisé quand l'action ne s'applique pas.
 fn action_button<'a>(label: &'static str, dialog: Option<Dialog>, danger: bool) -> Element<'a, Message> {
     let b = button(text(label).size(12)).on_press_maybe(dialog.map(Message::OpenDialog)).padding([3, 10]);
@@ -1912,4 +1958,30 @@ fn grid<'a>(
         .width(Fill)
         .height(Fill)
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ddl_is_detected_regardless_of_case_and_spacing() {
+        assert!(is_ddl("CREATE SCHEMA test"));
+        assert!(is_ddl("  create table t (id int)"));
+        assert!(is_ddl("ALTER TABLE t ADD COLUMN c TEXT"));
+        assert!(is_ddl("drop table t"));
+        assert!(!is_ddl("SELECT * FROM t"));
+        assert!(!is_ddl("INSERT INTO t VALUES (1)"));
+        assert!(!is_ddl("-- CREATE dans un commentaire\nSELECT 1"));
+    }
+
+    #[test]
+    fn preview_replaces_only_empty_or_generated_tabs() {
+        assert!(is_preview_sql(""));
+        assert!(is_preview_sql("   \n"));
+        assert!(is_preview_sql("SELECT * FROM \"public\".\"users\" LIMIT 100"));
+        assert!(!is_preview_sql("SELECT * FROM users\nWHERE id = 1"));
+        assert!(!is_preview_sql("SELECT name FROM users"));
+        assert!(!is_preview_sql("CREATE SCHEMA test"));
+    }
 }

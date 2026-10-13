@@ -50,6 +50,18 @@ cargo install cargo-bundle && cargo bundle --release
 
 L'icône est générée par `cargo run --release --example gen_icon -- assets/icon.png 1024`.
 
+## Tests
+
+```bash
+cargo test
+```
+
+Le test d'intégration PostgreSQL ne tourne que si `QUARRY_TEST_PG` contient une URL de connexion (il crée puis supprime un schéma `quarry_test_<pid>`) :
+
+```bash
+QUARRY_TEST_PG=postgres://user:motdepasse@localhost/ma_base cargo test postgres
+```
+
 ## Architecture
 
 ```text

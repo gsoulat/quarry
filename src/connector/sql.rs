@@ -231,6 +231,24 @@ impl Connector for SqlConnector {
         }
     }
 
+    async fn list_schemas(&self) -> Result<Vec<String>> {
+        match self {
+            Self::Postgres(pool) => {
+                let rows: Vec<(String,)> = sqlx::query_as(
+                    "SELECT nspname::text FROM pg_namespace
+                     WHERE nspname NOT LIKE 'pg\\_%' AND nspname <> 'information_schema'
+                     ORDER BY (nspname <> 'public'), nspname",
+                )
+                .fetch_all(pool)
+                .await
+                .map_err(err)?;
+                Ok(rows.into_iter().map(|(n,)| n).collect())
+            }
+            // MySQL : la base courante tient lieu de schéma ; SQLite n'en a pas.
+            Self::MySql(_) | Self::Sqlite(_) => Ok(Vec::new()),
+        }
+    }
+
     async fn describe_table(&self, table: &TableRef) -> Result<Vec<ColumnInfo>> {
         let to_info = |(name, data_type, nullable, default, primary_key)| ColumnInfo {
             name,
@@ -530,6 +548,41 @@ mod tests {
         assert_eq!(relations[0].from_columns, ["user_id"]);
         assert_eq!(relations[0].to.name, "users");
         assert_eq!(relations[0].to_columns, ["id"]);
+    }
+
+    #[tokio::test]
+    async fn sqlite_has_no_schemas() {
+        let c = demo().await;
+        assert!(c.list_schemas().await.unwrap().is_empty());
+    }
+
+    /// Test d'intégration PostgreSQL, joué seulement si `QUARRY_TEST_PG`
+    /// contient une URL (ex. `postgres://user:mdp@localhost/base`) :
+    /// un schéma neuf (vide) doit apparaître dans `list_schemas`, et une
+    /// table créée dedans dans `list_tables`.
+    #[tokio::test]
+    async fn postgres_new_schema_is_listed() {
+        let Ok(url) = std::env::var("QUARRY_TEST_PG") else {
+            eprintln!("QUARRY_TEST_PG absent : test PostgreSQL ignoré");
+            return;
+        };
+        let pool = PgPoolOptions::new().max_connections(1).connect(&url).await.expect("connexion");
+        let c = SqlConnector::Postgres(pool);
+        let schema = format!("quarry_test_{}", std::process::id());
+
+        c.execute(&format!("CREATE SCHEMA \"{schema}\"")).await.unwrap();
+        assert!(c.list_schemas().await.unwrap().contains(&schema), "schéma vide absent de list_schemas");
+
+        let table = TableRef { schema: Some(schema.clone()), name: "t".into() };
+        let ddl = c.create_table_sql(
+            &table,
+            &[super::super::ColumnDef { name: "id".into(), data_type: "SERIAL".into(), nullable: false, primary_key: true }],
+        );
+        c.execute(&ddl).await.unwrap();
+        assert!(c.list_tables().await.unwrap().contains(&table), "table absente de list_tables");
+
+        c.execute(&format!("DROP SCHEMA \"{schema}\" CASCADE")).await.unwrap();
+        assert!(!c.list_schemas().await.unwrap().contains(&schema));
     }
 
     #[tokio::test]
