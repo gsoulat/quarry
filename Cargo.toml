@@ -9,7 +9,7 @@ async-trait = "0.1.92"
 futures-util = "0.3.34"
 iced = { version = "0.14", features = ["tokio"] }
 serde_json = "1.0.154"
-sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "mysql", "sqlite", "chrono", "uuid", "json"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "mysql", "sqlite", "chrono", "uuid", "json"] }
 
 # Binaire le plus léger possible en release.
 [profile.release]
@@ -17,6 +17,11 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# Ne pas stripper les proc-macros : sur macOS, la dylib strippée ne se charge
+# plus (« mis-aligned LINKEDIT string pool »).
+[profile.release.build-override]
+strip = false
 
 [dev-dependencies]
 tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread"] }
