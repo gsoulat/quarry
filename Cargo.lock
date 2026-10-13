@@ -532,6 +532,7 @@ checksum = "5fa68281b1a76b54a62156474adb06bb380a67e07dd60656e3217152b42183f3"
 dependencies = [
  "atoi_simd",
  "byteorder",
+ "chrono",
  "codepage",
  "encoding_rs",
  "fast-float2",
@@ -644,6 +645,7 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
+ "serde",
  "wasm-bindgen",
  "windows-link",
 ]
@@ -3451,6 +3453,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8af83d2940bc0510f9aef86d865f56fdc6095f87ab115ac885a80b7c5226d3ba"
 dependencies = [
  "ahash",
+ "base64 0.23.1",
  "brotli",
  "bytes",
  "chrono",
@@ -3462,6 +3465,7 @@ dependencies = [
  "num-integer",
  "num-traits",
  "seq-macro",
+ "serde_json",
  "snap",
  "twox-hash",
  "zstd 0.14.2",

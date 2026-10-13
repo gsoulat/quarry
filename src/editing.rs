@@ -57,6 +57,8 @@ pub struct Pending {
     pub refresh: Refresh,
     /// Table à sélectionner une fois le SQL exécuté (créée, renommée…).
     pub select: Option<TableRef>,
+    /// Instructions exécutées à la suite de `sql` (import par lots).
+    pub extra: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +137,7 @@ impl RowForm {
                     sql: c.insert_sql(&self.table, &values),
                     refresh: Refresh::Data,
                     select: Some(self.table.clone()),
+                    extra: Vec::new(),
                 })
             }
             Some(original) => {
@@ -163,6 +166,7 @@ impl RowForm {
                     sql: c.update_sql(&self.table, &changed, &key),
                     refresh: Refresh::Data,
                     select: Some(self.table.clone()),
+                    extra: Vec::new(),
                 })
             }
         }
@@ -252,6 +256,7 @@ impl TableForm {
             sql: c.create_table_sql(&table, &columns),
             refresh: Refresh::Structure,
             select: Some(table),
+            extra: Vec::new(),
         })
     }
 }
@@ -271,6 +276,7 @@ impl ColumnForm {
             sql: c.alter_table_sql(&self.table, &Alter::AddColumn(def)),
             refresh: Refresh::Structure,
             select: Some(self.table.clone()),
+            extra: Vec::new(),
         })
     }
 }
@@ -307,6 +313,7 @@ impl RenameForm {
             sql: c.alter_table_sql(&self.table, &alter),
             refresh: Refresh::Structure,
             select: Some(select),
+            extra: Vec::new(),
         })
     }
 }
@@ -663,14 +670,21 @@ fn confirm_view(p: &Pending) -> Element<'_, Message> {
     } else {
         None
     };
+    let shown: String = p.sql.chars().take(4000).collect();
+    let truncated = p.sql.chars().count() > 4000;
     let mut content = column![
         label("Voici le SQL qui sera exécuté :"),
-        container(text(&p.sql).font(MONO).size(13))
+        container(text(format!("{shown}{}", if truncated { "\n…" } else { "" })).font(MONO).size(13))
             .style(theme::header_cell)
             .padding(12)
             .width(Fill),
     ]
     .spacing(10);
+    if !p.extra.is_empty() {
+        content = content.push(
+            text(format!("… suivi de {} autre(s) instruction(s) du même type.", p.extra.len())).size(12).color(theme::MUTED),
+        );
+    }
     if let Some(w) = warning {
         content = content.push(w);
     }

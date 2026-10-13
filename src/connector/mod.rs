@@ -200,6 +200,21 @@ pub trait Connector: Send + Sync + fmt::Debug {
         )
     }
 
+    /// INSERT multi-lignes (import par lots).
+    fn insert_many_sql(&self, table: &TableRef, columns: &[String], rows: &[Vec<Input>]) -> String {
+        let columns: Vec<_> = columns.iter().map(|c| self.quote_identifier(c)).collect();
+        let values: Vec<String> = rows
+            .iter()
+            .map(|row| format!("({})", row.iter().map(|v| self.input_literal(v)).collect::<Vec<_>>().join(", ")))
+            .collect();
+        format!(
+            "INSERT INTO {} ({})\nVALUES\n{}",
+            self.quote_table(table),
+            columns.join(", "),
+            values.join(",\n")
+        )
+    }
+
     fn update_sql(&self, table: &TableRef, set: &[(String, Input)], key: &[(String, Cell)]) -> String {
         let assignments: Vec<_> = set
             .iter()

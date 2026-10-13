@@ -21,6 +21,7 @@ use crate::design::{self, Design, DesignMessage};
 use crate::diagram::{self, Diagram};
 use crate::editing::{self, Dialog, DialogMessage, Refresh, RenameForm, RowForm, TableForm};
 use crate::export::{self, Format};
+use crate::import::{self, ImportForm, ImportMessage};
 use crate::manager::{self, Feedback, Field, Manager};
 use crate::store::{self, ConnectionConfig, Engine, HistoryEntry, Location, SavedQuery};
 use crate::theme;
@@ -163,6 +164,8 @@ pub struct App {
     schema_row: Option<usize>,
     dialog: Option<Dialog>,
     dialog_error: Option<String>,
+    import: Option<ImportForm>,
+    import_error: Option<String>,
     /// Menu « Édition » déroulé.
     edit_menu: bool,
     selected: Option<TableRef>,
@@ -256,6 +259,9 @@ pub enum Message {
     /// Exporte les lignes affichées (filtrées, triées) de la source.
     Export(ExportSource, Format),
     Exported(Result<Option<std::path::PathBuf>>),
+    ImportPick,
+    ImportRead(Result<Option<(std::path::PathBuf, import::ImportedFile)>>),
+    Import(ImportMessage),
     KeyPressed(Key, Modifiers),
 }
 
@@ -330,6 +336,8 @@ impl App {
             schema_row: None,
             dialog: None,
             dialog_error: None,
+            import: None,
+            import_error: None,
             edit_menu: false,
             selected: None,
             schema: Vec::new(),
@@ -691,10 +699,21 @@ impl App {
                     return Task::none();
                 };
                 let (sql, refresh, select) = (pending.sql.clone(), pending.refresh, pending.select.clone());
+                let extra = pending.extra.clone();
                 self.dialog = None;
-                self.status = Status::Busy("Exécution…".into());
+                self.status = Status::Busy(if extra.is_empty() {
+                    "Exécution…".into()
+                } else {
+                    format!("Exécution de {} instructions…", extra.len() + 1)
+                });
                 return Task::perform(
-                    async move { c.execute(&sql).await },
+                    async move {
+                        let mut total = c.execute(&sql).await?;
+                        for statement in extra {
+                            total += c.execute(&statement).await?;
+                        }
+                        Ok(total)
+                    },
                     move |r| Message::Executed(refresh, select.clone(), r),
                 );
             }
@@ -1037,6 +1056,50 @@ impl App {
             }
             Message::Exported(Ok(None)) => self.status = Status::Idle,
             Message::Exported(Err(e)) => self.status = Status::Error(e),
+            Message::ImportPick => {
+                if self.session.is_none() {
+                    return Task::none();
+                }
+                self.edit_menu = false;
+                self.status = Status::Busy("Choix du fichier…".into());
+                return Task::perform(import::pick_and_read(), Message::ImportRead);
+            }
+            Message::ImportRead(Ok(Some((path, file)))) => {
+                self.status = Status::Info(format!("{} ligne(s) lue(s)", file.rows.len()));
+                let existing = self.selected.clone().filter(|_| !self.schema.is_empty()).map(|t| (t, self.schema.clone()));
+                let engine = self.active_config().map_or(Engine::Postgres, |c| c.engine);
+                let mut form = ImportForm::new(path, file, existing, engine);
+                if form.new_schema.is_none()
+                    && let Some(session) = &self.session
+                {
+                    form.new_schema = session.schemas.iter().find(|s| *s == "public").or(session.schemas.first()).cloned();
+                }
+                self.import = Some(form);
+                self.import_error = None;
+            }
+            Message::ImportRead(Ok(None)) => self.status = Status::Idle,
+            Message::ImportRead(Err(e)) => self.status = Status::Error(e),
+            Message::Import(ImportMessage::Cancel) => {
+                self.import = None;
+                self.import_error = None;
+            }
+            Message::Import(ImportMessage::Submit) => {
+                let (Some(form), Some(c)) = (&self.import, self.connector()) else { return Task::none() };
+                match form.to_sql(c.as_ref()) {
+                    Ok(pending) => {
+                        self.import = None;
+                        self.import_error = None;
+                        self.dialog = Some(Dialog::Confirm(pending));
+                        self.dialog_error = None;
+                    }
+                    Err(e) => self.import_error = Some(e),
+                }
+            }
+            Message::Import(message) => {
+                if let Some(form) = &mut self.import {
+                    form.apply(message);
+                }
+            }
             Message::CellEditSubmit => {
                 let Some((row, col, text)) = self.editing_cell.take() else { return Task::none() };
                 let (Some(table), Some(data), Some(c)) = (self.selected.clone(), self.data.as_ref(), self.connector()) else {
@@ -1076,6 +1139,7 @@ impl App {
     /// Raccourcis globaux (hors éditeur, qui a les siens).
     fn handle_key(&mut self, key: Key, modifiers: Modifiers) -> Task<Message> {
         match key.as_ref() {
+            Key::Named(Named::Escape) if self.import.is_some() => self.update(Message::Import(ImportMessage::Cancel)),
             Key::Named(Named::Escape) if self.editing_cell.is_some() => self.update(Message::CellEditCancel),
             Key::Named(Named::Escape) if self.design.pending_link.is_some() => {
                 self.update(Message::Design(DesignMessage::LinkCancel))
@@ -1209,6 +1273,7 @@ impl App {
                             sql,
                             refresh: Refresh::Structure,
                             select: None,
+                            extra: Vec::new(),
                         }));
                         self.dialog_error = None;
                     }
@@ -1295,6 +1360,9 @@ impl App {
             return stack![base, manager::view(m, &self.connections)].into();
         }
         let engine = self.active_config().map_or(Engine::Postgres, |c| c.engine);
+        if let Some(form) = &self.import {
+            return stack![base, import::view(form, self.import_error.as_deref())].into();
+        }
         match &self.dialog {
             Some(d) => stack![base, editing::view(d, self.dialog_error.as_deref(), engine)].into(),
             None => base.into(),
@@ -1842,6 +1910,7 @@ impl App {
             sql: c.drop_table_sql(table),
             refresh: Refresh::Structure,
             select: None,
+            extra: Vec::new(),
         }))
     }
 
@@ -1866,6 +1935,7 @@ impl App {
             sql: c.alter_table_sql(table, &connector::Alter::DropColumn(column)),
             refresh: Refresh::Structure,
             select: Some(table.clone()),
+            extra: Vec::new(),
         }))
     }
 
@@ -1907,6 +1977,7 @@ impl App {
             sql: c.delete_sql(table, &key),
             refresh: Refresh::Data,
             select: Some(table.clone()),
+            extra: Vec::new(),
         }))
     }
 
@@ -1943,6 +2014,12 @@ impl App {
             item("Ajouter une ligne…", self.dialog_insert_row(), false),
             item("Modifier la ligne sélectionnée…", self.dialog_update_row(), false),
             item("Supprimer la ligne sélectionnée…", self.dialog_delete_row(), true),
+            section("FICHIERS"),
+            button(text("Importer un fichier (CSV, Excel, Parquet)…").size(13).color(theme::TEXT))
+                .on_press(Message::ImportPick)
+                .style(theme::list_item(false))
+                .padding([5, 12])
+                .width(Fill),
         ]
         .width(320);
 

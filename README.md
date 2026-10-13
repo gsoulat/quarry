@@ -8,6 +8,7 @@ Client de bases de données léger et multiplateforme (macOS, Linux, Windows), �
 - **Gestionnaire de connexions** (bouton « Gérer ») : ajouter, tester, modifier, supprimer, ranger dans des **dossiers**
 - **Menu « Édition »** : créer / renommer / supprimer une table, ajouter / renommer / supprimer une colonne (types dans un menu déroulant par moteur), insérer / modifier / supprimer une ligne (onglet Données). Le SQL généré est **affiché et confirmé avant exécution**
 - Barre latérale groupée en **Local / Distant / Cloud** : un clic pour se (re)connecter
+- **Import de fichiers** CSV, Excel et Parquet (menu Édition) : dans une table existante avec correspondance des colonnes, ou dans une nouvelle table aux types déduits
 - **Tunnel SSH** optionnel (clés ou agent, via le client `ssh` du système)
 - Mots de passe stockés dans le **trousseau du système** (Keychain, Gestionnaire d'identification Windows, Secret Service), jamais en clair sur le disque
 - Tables groupées par schéma, filtre, barre latérale **redimensionnable**, bouton `+` pour **insérer le nom d'une table au curseur**
@@ -88,6 +89,10 @@ src/
 ├── diagram.rs           diagramme des tables (canvas, placement, MPD/MLD/MCD, conception)
 ├── design.rs            panneau du mode conception et choix de relation
 ├── editing.rs           formulaires ligne / table / colonne et confirmation du SQL
+├── export.rs            export CSV / JSON / SQL / Excel
+├── import.rs            import CSV / Excel / Parquet
+├── completion.rs        autocomplétion SQL
+├── tunnel.rs            tunnel SSH via le client ssh du système
 └── connector/
     ├── mod.rs           trait Connector commun à tous les moteurs
     ├── sql.rs           PostgreSQL / MySQL / SQLite via sqlx
@@ -106,9 +111,6 @@ Pour ajouter un moteur (MongoDB/DocumentDB…), il suffit d'implémenter le trai
 - [ ] Connecteur MongoDB / DocumentDB
 - [x] Diagramme des relations (MCD / MLD / MPD)
 - [ ] Positions du diagramme mémorisées par connexion
-- [ ] Onglets de requêtes enregistrables
 - [ ] Connecteurs téléchargeables (processus séparés)
-- [ ] Tri et filtre des résultats
 - [x] Édition des lignes et des tables par l'interface
-- [ ] Import de fichiers (CSV, Parquet, Excel) dans une table
 - [ ] Thème clair

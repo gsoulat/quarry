@@ -6,7 +6,7 @@ description = "Client de bases de données léger et multiplateforme, écrit en 
 
 [dependencies]
 async-trait = "0.1.92"
-calamine = "0.36"
+calamine = { version = "0.36", features = ["dates"] }
 chrono = "0.4"
 csv = "1"
 directories = "6"
@@ -14,7 +14,7 @@ futures-util = "0.3.34"
 gcp-bigquery-client = { version = "0.28", optional = true }
 iced = { version = "0.14", features = ["canvas", "highlighter", "tokio"] }
 keyring = "4"
-parquet = { version = "60", default-features = false, features = ["snap", "zstd", "lz4", "brotli", "flate2", "flate2-rust_backend"] }
+parquet = { version = "60", default-features = false, features = ["snap", "zstd", "lz4", "brotli", "flate2", "flate2-rust_backend", "json"] }
 png = "0.18.1"
 rfd = "0.17"
 rust_xlsxwriter = "0.99"

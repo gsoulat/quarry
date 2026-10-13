@@ -6,6 +6,7 @@ mod diagram;
 mod editing;
 mod export;
 mod icon;
+mod import;
 mod manager;
 mod store;
 mod theme;
