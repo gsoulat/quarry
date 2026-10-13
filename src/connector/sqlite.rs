@@ -29,6 +29,10 @@ fn dialect() -> Dialect {
         types: ["INTEGER", "REAL", "TEXT", "BLOB", "NUMERIC"].map(String::from).to_vec(),
         id_type: "INTEGER".into(),
         import_types: ["INTEGER".into(), "REAL".into(), "INTEGER".into(), "TEXT".into()],
+        create_table_suffix: None,
+        preview_sql: None,
+        rename_table_sql: None,
+        rename_column_sql: None,
     }
 }
 

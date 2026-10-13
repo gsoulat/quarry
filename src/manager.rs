@@ -48,6 +48,9 @@ pub struct Form {
     pub ssh_port: String,
     pub ssh_user: String,
     pub ssh_key: String,
+    /// Champs déclarés par le moteur, par clé (les secrets ne sont remplis
+    /// que lorsqu'on les saisit : vide = inchangé).
+    pub extra: std::collections::HashMap<String, String>,
 }
 
 impl Form {
@@ -69,6 +72,7 @@ impl Form {
             ssh_port: String::new(),
             ssh_user: String::new(),
             ssh_key: String::new(),
+            extra: Default::default(),
         }
     }
 
@@ -89,6 +93,7 @@ impl Form {
             ssh_port: config.ssh_port.map(|p| p.to_string()).unwrap_or_default(),
             ssh_user: config.ssh_user.clone(),
             ssh_key: config.ssh_key.clone(),
+            extra: config.extra.clone(),
         }
     }
 
@@ -138,7 +143,18 @@ impl Form {
             }
             EngineForm::File => required(&self.path, "Fichier")?,
             EngineForm::Cloud => required(&self.project_id, "Projet GCP")?,
+            EngineForm::Custom => {}
         }
+        for field in self.engine.fields.iter().filter(|f| f.required && !f.secret) {
+            required(self.extra.get(&field.key).map_or("", String::as_str), &field.label)?;
+        }
+        // Les secrets vont au trousseau : on ne garde ici que le reste.
+        let extra = self
+            .extra
+            .iter()
+            .filter(|(k, _)| !self.engine.fields.iter().any(|f| f.secret && &f.key == *k))
+            .map(|(k, v)| (k.clone(), v.trim().to_string()))
+            .collect();
         let port = match self.port.trim() {
             "" => None,
             p => Some(p.parse::<u16>().map_err(|_| format!("Port invalide : « {p} »"))?),
@@ -163,6 +179,7 @@ impl Form {
             ssh_port,
             ssh_user: self.ssh_user.trim().into(),
             ssh_key: self.ssh_key.trim().into(),
+            extra,
         })
     }
 }
@@ -381,6 +398,7 @@ fn form_view(manager: &Manager) -> Element<'_, Message> {
             &form.path,
             Field::Path,
         )),
+        EngineForm::Custom => fields,
         EngineForm::Cloud => fields
             .push(input("Projet GCP", "mon-projet-123", &form.project_id, Field::ProjectId))
             .push(input(
@@ -390,6 +408,28 @@ fn form_view(manager: &Manager) -> Element<'_, Message> {
                 Field::CredentialsPath,
             )),
     };
+
+    // Champs déclarés par le moteur (catalogue) : texte, ou secret masqué.
+    for spec in &form.engine.fields {
+        let key = spec.key.clone();
+        let value = form.extra.get(&spec.key).map_or("", String::as_str);
+        let placeholder = if spec.secret && manager.editing.is_some() && value.is_empty() {
+            "(inchangé, stocké dans le trousseau)".to_string()
+        } else {
+            spec.placeholder.clone()
+        };
+        let label_text = if spec.required { format!("{} *", spec.label) } else { spec.label.clone() };
+        fields = fields.push(
+            column![
+                text(label_text).size(12).color(theme::MUTED),
+                text_input(&placeholder, value)
+                    .on_input(move |v| Message::FormExtra(key.clone(), v))
+                    .secure(spec.secret && !manager.show_password)
+                    .padding(8),
+            ]
+            .spacing(4),
+        );
+    }
 
     let feedback = match &manager.feedback {
         None => text(""),

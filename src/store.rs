@@ -20,6 +20,22 @@ pub enum Form {
     File,
     /// Projet et clé (BigQuery…).
     Cloud,
+    /// Uniquement les champs déclarés par le moteur (Snowflake…).
+    Custom,
+}
+
+/// Champ de connexion propre à un moteur, déclaré par le catalogue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FieldSpec {
+    pub key: String,
+    pub label: String,
+    #[serde(default)]
+    pub placeholder: String,
+    /// Rangé dans le trousseau, jamais dans le fichier de configuration.
+    #[serde(default)]
+    pub secret: bool,
+    #[serde(default)]
+    pub required: bool,
 }
 
 /// Un moteur de base de données, tel que décrit par le catalogue (moteurs
@@ -35,6 +51,9 @@ pub struct Engine {
     pub default_port: Option<u16>,
     #[serde(default)]
     pub description: String,
+    /// Champs supplémentaires (entrepôt Snowflake, région AWS…).
+    #[serde(default)]
+    pub fields: Vec<FieldSpec>,
 }
 
 impl Engine {
@@ -47,6 +66,7 @@ impl Engine {
             form,
             default_port: port,
             description: desc.into(),
+            fields: Vec::new(),
         };
         vec![
             e("sqlite", "SQLite", None, Form::File, None, "Intégré à Quarry, aucun téléchargement."),
@@ -99,6 +119,8 @@ impl<'de> Deserialize<'de> for Engine {
                 default_port: Option<u16>,
                 #[serde(default)]
                 description: String,
+                #[serde(default)]
+                fields: Vec<FieldSpec>,
             },
         }
         match Raw::deserialize(deserializer)? {
@@ -112,8 +134,8 @@ impl<'de> Deserialize<'de> for Engine {
                 };
                 Engine::builtin(id).ok_or_else(|| serde::de::Error::custom(format!("moteur inconnu : {name}")))
             }
-            Raw::Full { id, name, connector, form, default_port, description } => {
-                Ok(Engine { id, name, connector, form, default_port, description })
+            Raw::Full { id, name, connector, form, default_port, description, fields } => {
+                Ok(Engine { id, name, connector, form, default_port, description, fields })
             }
         }
     }
@@ -201,6 +223,10 @@ pub struct ConnectionConfig {
     /// Chemin d'une clé privée ; vide = clés par défaut ou agent SSH.
     #[serde(default)]
     pub ssh_key: String,
+    /// Valeurs des champs déclarés par le moteur (hors secrets, qui vont au
+    /// trousseau), par clé.
+    #[serde(default)]
+    pub extra: std::collections::HashMap<String, String>,
 }
 
 impl ConnectionConfig {
@@ -216,7 +242,7 @@ impl ConnectionConfig {
         // provisoire ne range en local que SQLite.
         match self.engine.form {
             Form::File => Location::Local,
-            Form::Cloud => Location::Cloud,
+            Form::Cloud | Form::Custom => Location::Cloud,
             Form::Server => Location::Remote,
         }
     }
@@ -226,6 +252,15 @@ impl ConnectionConfig {
         match self.engine.form {
             Form::File => self.path.clone(),
             Form::Cloud => self.project_id.clone(),
+            // Premier champ déclaré non secret (compte Snowflake, région…).
+            Form::Custom => self
+                .engine
+                .fields
+                .iter()
+                .find(|f| !f.secret)
+                .and_then(|f| self.extra.get(&f.key))
+                .cloned()
+                .unwrap_or_default(),
             Form::Server => {
                 let port = self.port.or(self.engine.default_port()).unwrap_or_default();
                 let via = if self.uses_tunnel() { format!(" via ssh {}", self.ssh_host.trim()) } else { String::new() };
@@ -280,7 +315,9 @@ pub fn save(connections: &[ConnectionConfig]) -> Result<(), String> {
 /// chaque base.
 const KEYRING_ACCOUNT: &str = "connections";
 
-type Vault = std::collections::HashMap<u64, String>;
+/// Clés : `"<id>"` pour le mot de passe principal, `"<id>/<champ>"` pour un
+/// champ secret déclaré par le moteur.
+type Vault = std::collections::HashMap<String, String>;
 
 fn vault_cache() -> &'static std::sync::Mutex<Option<Vault>> {
     static CACHE: std::sync::Mutex<Option<Vault>> = std::sync::Mutex::new(None);
@@ -322,13 +359,13 @@ fn write_vault(vault: Vault) -> Result<(), String> {
 
 pub fn password(id: u64) -> Result<Option<String>, String> {
     let mut vault = vault()?;
-    if let Some(p) = vault.get(&id) {
+    if let Some(p) = vault.get(&id.to_string()) {
         return Ok(Some(p.clone()));
     }
     // Migration depuis l'ancien élément par connexion, s'il existe.
     match legacy_entry(id)?.get_password() {
         Ok(p) => {
-            vault.insert(id, p.clone());
+            vault.insert(id.to_string(), p.clone());
             write_vault(vault)?;
             let _ = legacy_entry(id)?.delete_credential();
             Ok(Some(p))
@@ -340,13 +377,28 @@ pub fn password(id: u64) -> Result<Option<String>, String> {
 
 pub fn set_password(id: u64, password: &str) -> Result<(), String> {
     let mut vault = vault()?;
-    vault.insert(id, password.to_owned());
+    vault.insert(id.to_string(), password.to_owned());
     write_vault(vault)
 }
 
+/// Champ secret déclaré par le moteur (clé privée Snowflake, jeton…).
+pub fn secret(id: u64, key: &str) -> Result<Option<String>, String> {
+    Ok(vault()?.get(&format!("{id}/{key}")).cloned())
+}
+
+pub fn set_secret(id: u64, key: &str, value: &str) -> Result<(), String> {
+    let mut vault = vault()?;
+    vault.insert(format!("{id}/{key}"), value.to_owned());
+    write_vault(vault)
+}
+
+/// Retire le mot de passe et tous les secrets d'une connexion.
 pub fn delete_password(id: u64) -> Result<(), String> {
     let mut vault = vault()?;
-    if vault.remove(&id).is_some() {
+    let prefix = format!("{id}/");
+    let before = vault.len();
+    vault.retain(|k, _| k != &id.to_string() && !k.starts_with(&prefix));
+    if vault.len() != before {
         write_vault(vault)?;
     }
     let _ = legacy_entry(id).and_then(|e| e.delete_credential().map_err(|e| e.to_string()));
@@ -504,6 +556,7 @@ mod tests {
                 ssh_port: None,
                 ssh_user: String::new(),
                 ssh_key: String::new(),
+                extra: Default::default(),
             };
             save(std::slice::from_ref(&config)).unwrap();
             let loaded = load().unwrap();
