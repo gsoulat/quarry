@@ -8,7 +8,7 @@ use iced::{Background, Color, Element, Fill, Font};
 
 use crate::app::Message;
 use crate::plugins::{self, Installed, Registry};
-use crate::store::{ConnectionConfig, Engine};
+use crate::store::{ConnectionConfig, Engine, Form as EngineForm};
 use crate::theme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,12 +52,13 @@ pub struct Form {
 
 impl Form {
     pub fn new(engine: Engine) -> Self {
+        let port = engine.default_port().map(|p| p.to_string()).unwrap_or_default();
         Self {
             engine,
             name: String::new(),
             folder: String::new(),
             host: "localhost".into(),
-            port: engine.default_port().map(|p| p.to_string()).unwrap_or_default(),
+            port,
             user: String::new(),
             password: String::new(),
             database: String::new(),
@@ -73,7 +74,7 @@ impl Form {
 
     pub fn from_config(config: &ConnectionConfig) -> Self {
         Self {
-            engine: config.engine,
+            engine: config.engine.clone(),
             name: config.name.clone(),
             folder: config.folder.clone(),
             host: config.host.clone(),
@@ -120,18 +121,23 @@ impl Form {
         self.engine = engine;
     }
 
+    /// Clone le moteur de la connexion ; les champs vides selon le formulaire.
+    fn engine_form(&self) -> EngineForm {
+        self.engine.form
+    }
+
     pub fn to_config(&self, id: u64) -> Result<ConnectionConfig, String> {
         let required = |value: &str, label: &str| {
             if value.trim().is_empty() { Err(format!("Champ « {label} » obligatoire")) } else { Ok(()) }
         };
         required(&self.name, "Nom")?;
-        match self.engine {
-            Engine::Postgres | Engine::MySql => {
+        match self.engine_form() {
+            EngineForm::Server => {
                 required(&self.host, "Hôte")?;
                 required(&self.user, "Utilisateur")?;
             }
-            Engine::Sqlite => required(&self.path, "Fichier")?,
-            Engine::BigQuery => required(&self.project_id, "Projet GCP")?,
+            EngineForm::File => required(&self.path, "Fichier")?,
+            EngineForm::Cloud => required(&self.project_id, "Projet GCP")?,
         }
         let port = match self.port.trim() {
             "" => None,
@@ -144,7 +150,7 @@ impl Form {
         Ok(ConnectionConfig {
             id,
             name: self.name.trim().into(),
-            engine: self.engine,
+            engine: self.engine.clone(),
             folder: self.folder.trim().into(),
             host: self.host.trim().into(),
             port,
@@ -181,13 +187,21 @@ pub struct Manager {
     /// Connecteur en cours de téléchargement.
     pub installing: Option<String>,
     pub plugins_feedback: Option<Feedback>,
+    /// Moteurs proposés (intégrés + registre).
+    pub catalog: Vec<Engine>,
 }
 
 impl Manager {
-    pub fn new() -> Self {
+    pub fn new(catalog: Vec<Engine>) -> Self {
+        let default = catalog
+            .iter()
+            .find(|e| e.id == "postgres")
+            .or(catalog.first())
+            .cloned()
+            .unwrap_or_else(|| Engine::builtin("sqlite").unwrap());
         Self {
             editing: None,
-            form: Form::new(Engine::Postgres),
+            form: Form::new(default),
             feedback: None,
             show_password: false,
             plugins_page: false,
@@ -195,14 +209,15 @@ impl Manager {
             registry: None,
             installing: None,
             plugins_feedback: None,
+            catalog,
         }
     }
 
-    pub fn edit(config: &ConnectionConfig) -> Self {
-        Self { editing: Some(config.id), form: Form::from_config(config), ..Self::new() }
+    pub fn edit(config: &ConnectionConfig, catalog: Vec<Engine>) -> Self {
+        Self { editing: Some(config.id), form: Form::from_config(config), ..Self::new(catalog) }
     }
 
-    pub fn is_installed(&self, engine: Engine) -> bool {
+    pub fn is_installed(&self, engine: &Engine) -> bool {
         engine.plugin_id().is_none_or(|id| self.installed.iter().any(|i| i.id == id))
     }
 }
@@ -279,7 +294,7 @@ fn form_view(manager: &Manager) -> Element<'_, Message> {
     .align_y(iced::Center);
 
     let mut fields = column![header].spacing(12);
-    if !manager.is_installed(form.engine) {
+    if !manager.is_installed(&form.engine) {
         let size = manager
             .registry
             .as_ref()
@@ -309,15 +324,15 @@ fn form_view(manager: &Manager) -> Element<'_, Message> {
             input("Dossier", "Clients, Perso… (optionnel)", &form.folder, Field::Folder).width(Fill),
             column![
                 text("Moteur").size(12).color(theme::MUTED),
-                pick_list(Engine::ALL, Some(form.engine), Message::FormEngine).padding(8),
+                pick_list(manager.catalog.clone(), Some(form.engine.clone()), Message::FormEngine).padding(8),
             ]
             .spacing(4),
         ]
         .spacing(12),
     );
 
-    fields = match form.engine {
-        Engine::Postgres | Engine::MySql => {
+    fields = match form.engine.form {
+        EngineForm::Server => {
             let password_hint = if manager.editing.is_some() {
                 "(inchangé)"
             } else {
@@ -360,13 +375,13 @@ fn form_view(manager: &Manager) -> Element<'_, Message> {
                 )
                 .push(input("Clé privée", "vide = ~/.ssh/id_* ou agent", &form.ssh_key, Field::SshKey))
         }
-        Engine::Sqlite => fields.push(input(
+        EngineForm::File => fields.push(input(
             "Fichier",
             "/chemin/vers/base.db (créé s'il n'existe pas)",
             &form.path,
             Field::Path,
         )),
-        Engine::BigQuery => fields
+        EngineForm::Cloud => fields
             .push(input("Projet GCP", "mon-projet-123", &form.project_id, Field::ProjectId))
             .push(input(
                 "Clé de compte de service (JSON)",

@@ -22,7 +22,7 @@ use async_trait::async_trait;
 pub use plan::execution_order;
 pub use quarry_protocol::{Cell, ColumnInfo, Dialect, PlanNode, QueryPlan, QueryResult, Relation, TableRef};
 
-use crate::store::{ConnectionConfig, Engine};
+use crate::store::ConnectionConfig;
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -244,10 +244,11 @@ pub trait Connector: Send + Sync + fmt::Debug {
 
 /// Ouvre une connexion enregistrée, avec son mot de passe éventuel.
 pub async fn connect(config: &ConnectionConfig, password: Option<String>) -> Result<Arc<dyn Connector>> {
-    match config.engine {
-        Engine::Sqlite => Ok(Arc::new(sqlite::Sqlite::connect(&config.path).await?)),
-        engine => {
-            let id = engine.plugin_id().ok_or("Moteur sans connecteur")?;
+    let engine = &config.engine;
+    match engine.plugin_id() {
+        None if engine.id == "sqlite" => Ok(Arc::new(sqlite::Sqlite::connect(&config.path).await?)),
+        None => Err(format!("Moteur intégré inconnu : {}", engine.id)),
+        Some(id) => {
             let binary = crate::plugins::installed_binary(id).ok_or_else(|| {
                 format!("Le connecteur {engine} n'est pas installé : ouvre « Gérer » puis « Connecteurs » pour le télécharger.")
             })?;

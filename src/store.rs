@@ -10,50 +10,137 @@ use serde::{Deserialize, Serialize};
 
 const KEYRING_SERVICE: &str = "quarry";
 
+/// Type de formulaire de connexion d'un moteur.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Engine {
-    Postgres,
-    MySql,
-    Sqlite,
-    BigQuery,
+#[serde(rename_all = "lowercase")]
+pub enum Form {
+    /// Hôte, port, utilisateur, mot de passe, base.
+    Server,
+    /// Chemin d'un fichier.
+    File,
+    /// Projet et clé (BigQuery…).
+    Cloud,
+}
+
+/// Un moteur de base de données, tel que décrit par le catalogue (moteurs
+/// intégrés + registre des connecteurs). Chaque connexion enregistrée en
+/// garde une copie : elle reste utilisable hors ligne et si le registre change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Engine {
+    pub id: String,
+    pub name: String,
+    /// Connecteur téléchargeable qui sert ce moteur ; `None` = intégré (SQLite).
+    pub connector: Option<String>,
+    pub form: Form,
+    pub default_port: Option<u16>,
+    #[serde(default)]
+    pub description: String,
 }
 
 impl Engine {
-    pub const ALL: [Engine; 4] = [Engine::Postgres, Engine::MySql, Engine::Sqlite, Engine::BigQuery];
+    /// Moteurs connus sans le registre (hors ligne, premier lancement).
+    pub fn builtins() -> Vec<Engine> {
+        let e = |id: &str, name: &str, connector: Option<&str>, form: Form, port: Option<u16>, desc: &str| Engine {
+            id: id.into(),
+            name: name.into(),
+            connector: connector.map(String::from),
+            form,
+            default_port: port,
+            description: desc.into(),
+        };
+        vec![
+            e("sqlite", "SQLite", None, Form::File, None, "Intégré à Quarry, aucun téléchargement."),
+            e("postgres", "PostgreSQL", Some("postgres"), Form::Server, Some(5432), "PostgreSQL 10 et plus."),
+            e("mysql", "MySQL", Some("mysql"), Form::Server, Some(3306), "MySQL 8 ; le plan nécessite 8.0.18 ou plus."),
+            e("bigquery", "Google BigQuery", Some("bigquery"), Form::Cloud, None, "SQL standard, coût estimé par dry run."),
+        ]
+    }
 
-    pub fn default_port(self) -> Option<u16> {
-        match self {
-            Engine::Postgres => Some(5432),
-            Engine::MySql => Some(3306),
-            Engine::Sqlite | Engine::BigQuery => None,
-        }
+    pub fn builtin(id: &str) -> Option<Engine> {
+        Self::builtins().into_iter().find(|e| e.id == id)
+    }
+
+    pub fn default_port(&self) -> Option<u16> {
+        self.default_port
     }
 
     /// Moteur client/serveur (hôte, port, utilisateur, mot de passe).
-    pub fn is_server(self) -> bool {
-        matches!(self, Engine::Postgres | Engine::MySql)
+    pub fn is_server(&self) -> bool {
+        self.form == Form::Server
     }
 
-    /// Identifiant du connecteur téléchargeable ; `None` pour SQLite, intégré.
-    pub fn plugin_id(self) -> Option<&'static str> {
-        match self {
-            Engine::Postgres => Some("postgres"),
-            Engine::MySql => Some("mysql"),
-            Engine::BigQuery => Some("bigquery"),
-            Engine::Sqlite => None,
-        }
+    /// Identifiant du connecteur téléchargeable ; `None` pour un moteur intégré.
+    pub fn plugin_id(&self) -> Option<&str> {
+        self.connector.as_deref()
     }
 }
 
 impl fmt::Display for Engine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Engine::Postgres => "PostgreSQL",
-            Engine::MySql => "MySQL",
-            Engine::Sqlite => "SQLite",
-            Engine::BigQuery => "BigQuery",
-        })
+        f.write_str(&self.name)
     }
+}
+
+/// Accepte l'ancien format (`"Postgres"`, `"MySql"`, `"Sqlite"`, `"BigQuery"`)
+/// comme le nouveau (objet complet).
+impl<'de> Deserialize<'de> for Engine {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Legacy(String),
+            Full {
+                id: String,
+                name: String,
+                #[serde(default)]
+                connector: Option<String>,
+                form: Form,
+                #[serde(default)]
+                default_port: Option<u16>,
+                #[serde(default)]
+                description: String,
+            },
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Legacy(name) => {
+                let id = match name.as_str() {
+                    "Postgres" => "postgres",
+                    "MySql" => "mysql",
+                    "Sqlite" => "sqlite",
+                    "BigQuery" => "bigquery",
+                    other => other,
+                };
+                Engine::builtin(id).ok_or_else(|| serde::de::Error::custom(format!("moteur inconnu : {name}")))
+            }
+            Raw::Full { id, name, connector, form, default_port, description } => {
+                Ok(Engine { id, name, connector, form, default_port, description })
+            }
+        }
+    }
+}
+
+/// Catalogue des moteurs : intégrés, complétés par le registre (mis en cache
+/// dans `engines.json` pour fonctionner hors ligne).
+pub fn load_catalog() -> Vec<Engine> {
+    let cached: Vec<Engine> = read_json(config_dir().map(|d| d.join("engines.json")));
+    merge_catalog(Engine::builtins(), cached)
+}
+
+pub fn save_catalog(engines: &[Engine]) -> Result<(), String> {
+    write_json(config_dir().map(|d| d.join("engines.json")), &engines)
+}
+
+/// Les entrées de `extra` remplacent celles de `base` de même id ; les
+/// nouvelles s'ajoutent à la fin.
+pub fn merge_catalog(base: Vec<Engine>, extra: Vec<Engine>) -> Vec<Engine> {
+    let mut out = base;
+    for e in extra {
+        match out.iter_mut().find(|b| b.id == e.id) {
+            Some(slot) => *slot = e,
+            None => out.push(e),
+        }
+    }
+    out
 }
 
 /// Groupe d'affichage dans la barre latérale.
@@ -127,19 +214,19 @@ impl ConnectionConfig {
     pub fn location(&self) -> Location {
         // TODO(toi) : décider ce qui compte comme « local ». Cette version
         // provisoire ne range en local que SQLite.
-        match self.engine {
-            Engine::Sqlite => Location::Local,
-            Engine::BigQuery => Location::Cloud,
-            Engine::Postgres | Engine::MySql => Location::Remote,
+        match self.engine.form {
+            Form::File => Location::Local,
+            Form::Cloud => Location::Cloud,
+            Form::Server => Location::Remote,
         }
     }
 
     /// Résumé affiché sous le nom (« localhost:5432/app », « mon-projet »…).
     pub fn summary(&self) -> String {
-        match self.engine {
-            Engine::Sqlite => self.path.clone(),
-            Engine::BigQuery => self.project_id.clone(),
-            Engine::Postgres | Engine::MySql => {
+        match self.engine.form {
+            Form::File => self.path.clone(),
+            Form::Cloud => self.project_id.clone(),
+            Form::Server => {
                 let port = self.port.or(self.engine.default_port()).unwrap_or_default();
                 let via = if self.uses_tunnel() { format!(" via ssh {}", self.ssh_host.trim()) } else { String::new() };
                 format!("{}:{port}/{}{via}", self.host, self.database)
@@ -378,6 +465,25 @@ mod tests {
     }
 
     #[test]
+    fn legacy_engine_names_still_load() {
+        let json = r#"[{"id":1,"name":"old","engine":"Postgres","host":"h","port":5432,"user":"u","database":"d",
+            "path":"","project_id":"","credentials_path":""}]"#;
+        let loaded: Vec<ConnectionConfig> = serde_json::from_str(json).unwrap();
+        assert_eq!(loaded[0].engine.id, "postgres");
+        assert!(loaded[0].engine.is_server());
+    }
+
+    #[test]
+    fn catalog_merge_replaces_by_id() {
+        let mut extra = Engine::builtin("postgres").unwrap();
+        extra.name = "PostgreSQL 17".into();
+        let cockroach = Engine { id: "cockroachdb".into(), name: "CockroachDB".into(), ..extra.clone() };
+        let merged = merge_catalog(Engine::builtins(), vec![extra, cockroach]);
+        assert_eq!(merged.len(), 5);
+        assert_eq!(merged.iter().find(|e| e.id == "postgres").unwrap().name, "PostgreSQL 17");
+    }
+
+    #[test]
     fn connections_survive_a_reload() {
         let _guard = SERIAL.lock().unwrap();
         with_temp_config("connections", || {
@@ -385,7 +491,7 @@ mod tests {
             let config = ConnectionConfig {
                 id: 1,
                 name: "Local".into(),
-                engine: Engine::Postgres,
+                engine: Engine::builtin("postgres").unwrap(),
                 folder: "Perso".into(),
                 host: "localhost".into(),
                 port: Some(5432),

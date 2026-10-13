@@ -44,6 +44,9 @@ pub struct Registry {
     pub tag: String,
     #[serde(default)]
     pub connectors: Vec<Entry>,
+    /// Catalogue des moteurs (alias compris) servis par ces connecteurs.
+    #[serde(default)]
+    pub engines: Vec<crate::store::Engine>,
 }
 
 /// Un connecteur présent sur le disque.

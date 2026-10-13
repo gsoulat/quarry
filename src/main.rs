@@ -19,7 +19,11 @@ fn main() -> iced::Result {
     // Au démarrage : l'état, puis une vérification de mise à jour en arrière-plan.
     let boot = || {
         let app = App::new();
-        (app, iced::Task::perform(plugins::check_app_update(), app::Message::UpdateChecked))
+        let tasks = iced::Task::batch([
+            iced::Task::perform(plugins::check_app_update(), app::Message::UpdateChecked),
+            iced::Task::perform(plugins::fetch_registry(), app::Message::PluginsLoaded),
+        ]);
+        (app, tasks)
     };
     iced::application(boot, App::update, App::view)
         .title(App::title)

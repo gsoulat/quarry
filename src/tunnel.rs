@@ -110,7 +110,7 @@ mod tests {
         let config = ConnectionConfig {
             id: 1,
             name: "prod".into(),
-            engine: Engine::Postgres,
+            engine: Engine::builtin("postgres").unwrap(),
             folder: String::new(),
             host: "db.internal".into(),
             port: None,

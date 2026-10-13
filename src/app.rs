@@ -173,6 +173,8 @@ pub struct App {
     edit_menu: bool,
     /// Nouvelle version de Quarry publiée sur GitHub.
     update: Option<plugins::AppUpdate>,
+    /// Moteurs proposés : intégrés + registre (mis en cache).
+    catalog: Vec<Engine>,
     selected: Option<TableRef>,
     schema: Vec<ColumnInfo>,
     tab: Tab,
@@ -308,7 +310,8 @@ impl App {
             Err(e) => (Vec::new(), Status::Error(e)),
         };
         // Premier lancement : on ouvre directement le gestionnaire.
-        let manager = connections.is_empty().then(Manager::new);
+        let catalog = store::load_catalog();
+        let manager = connections.is_empty().then(|| Manager::new(catalog.clone()));
 
         let panes = pane_grid::State::with_configuration(pane_grid::Configuration::Split {
             axis: pane_grid::Axis::Vertical,
@@ -354,6 +357,7 @@ impl App {
             import_error: None,
             edit_menu: false,
             update: None,
+            catalog,
             selected: None,
             schema: Vec::new(),
             tabs: vec![QueryTab::new(1, "Requête 1".into(), "SELECT 1 AS hello")],
@@ -825,14 +829,18 @@ impl App {
 
             Message::OpenManager => {
                 self.manager = Some(match self.active_config() {
-                    Some(config) => Manager::edit(config),
-                    None => Manager::new(),
+                    Some(config) => Manager::edit(config, self.catalog.clone()),
+                    None => Manager::new(self.catalog.clone()),
                 });
             }
             Message::CloseManager => self.manager = None,
             Message::EditConnection(id) => {
                 let config = id.and_then(|id| self.connections.iter().find(|c| c.id == id));
-                self.manager = Some(config.map_or_else(Manager::new, Manager::edit));
+                let catalog = self.catalog.clone();
+                self.manager = Some(match config {
+                    Some(c) => Manager::edit(c, catalog),
+                    None => Manager::new(catalog),
+                });
             }
             Message::FormChanged(field, value) => {
                 if let Some(m) = &mut self.manager {
@@ -850,7 +858,8 @@ impl App {
                 }
             }
             Message::OpenPlugins => {
-                let m = self.manager.get_or_insert_with(Manager::new);
+                let catalog = self.catalog.clone();
+                let m = self.manager.get_or_insert_with(|| Manager::new(catalog));
                 m.plugins_page = true;
                 m.installed = plugins::installed();
                 if m.registry.is_none() {
@@ -865,6 +874,15 @@ impl App {
                 return Task::perform(plugins::fetch_registry(), Message::PluginsLoaded);
             }
             Message::PluginsLoaded(result) => {
+                if let Ok(registry) = &result
+                    && !registry.engines.is_empty()
+                {
+                    self.catalog = store::merge_catalog(Engine::builtins(), registry.engines.clone());
+                    let _ = store::save_catalog(&self.catalog);
+                    if let Some(m) = &mut self.manager {
+                        m.catalog = self.catalog.clone();
+                    }
+                }
                 if let Some(m) = &mut self.manager {
                     match result {
                         Ok(registry) => {
@@ -956,7 +974,7 @@ impl App {
                     self.session = None;
                 }
                 let result = store::delete_password(id).and(store::save(&self.connections));
-                let mut manager = Manager::new();
+                let mut manager = Manager::new(self.catalog.clone());
                 manager.feedback = Some(match result {
                     Ok(()) => Feedback::Ok("Connexion supprimée".into()),
                     Err(e) => Feedback::Error(e),
