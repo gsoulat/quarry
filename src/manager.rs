@@ -22,6 +22,10 @@ pub enum Field {
     Path,
     ProjectId,
     CredentialsPath,
+    SshHost,
+    SshPort,
+    SshUser,
+    SshKey,
 }
 
 /// Valeurs saisies, gardées en texte tant qu'elles ne sont pas validées.
@@ -39,6 +43,10 @@ pub struct Form {
     pub path: String,
     pub project_id: String,
     pub credentials_path: String,
+    pub ssh_host: String,
+    pub ssh_port: String,
+    pub ssh_user: String,
+    pub ssh_key: String,
 }
 
 impl Form {
@@ -55,6 +63,10 @@ impl Form {
             path: String::new(),
             project_id: String::new(),
             credentials_path: String::new(),
+            ssh_host: String::new(),
+            ssh_port: String::new(),
+            ssh_user: String::new(),
+            ssh_key: String::new(),
         }
     }
 
@@ -71,6 +83,10 @@ impl Form {
             path: config.path.clone(),
             project_id: config.project_id.clone(),
             credentials_path: config.credentials_path.clone(),
+            ssh_host: config.ssh_host.clone(),
+            ssh_port: config.ssh_port.map(|p| p.to_string()).unwrap_or_default(),
+            ssh_user: config.ssh_user.clone(),
+            ssh_key: config.ssh_key.clone(),
         }
     }
 
@@ -86,6 +102,10 @@ impl Form {
             Field::Path => &mut self.path,
             Field::ProjectId => &mut self.project_id,
             Field::CredentialsPath => &mut self.credentials_path,
+            Field::SshHost => &mut self.ssh_host,
+            Field::SshPort => &mut self.ssh_port,
+            Field::SshUser => &mut self.ssh_user,
+            Field::SshKey => &mut self.ssh_key,
         };
         *target = value;
     }
@@ -116,6 +136,10 @@ impl Form {
             "" => None,
             p => Some(p.parse::<u16>().map_err(|_| format!("Port invalide : « {p} »"))?),
         };
+        let ssh_port = match self.ssh_port.trim() {
+            "" => None,
+            p => Some(p.parse::<u16>().map_err(|_| format!("Port SSH invalide : « {p} »"))?),
+        };
         Ok(ConnectionConfig {
             id,
             name: self.name.trim().into(),
@@ -128,6 +152,10 @@ impl Form {
             path: self.path.trim().into(),
             project_id: self.project_id.trim().into(),
             credentials_path: self.credentials_path.trim().into(),
+            ssh_host: self.ssh_host.trim().into(),
+            ssh_port,
+            ssh_user: self.ssh_user.trim().into(),
+            ssh_key: self.ssh_key.trim().into(),
         })
     }
 }
@@ -281,6 +309,16 @@ fn form_view(manager: &Manager) -> Element<'_, Message> {
                     .spacing(12),
                 )
                 .push(input("Base de données", "optionnel", &form.database, Field::Database))
+                .push(text("TUNNEL SSH (optionnel) — hôte et port ci-dessus sont alors vus depuis le serveur SSH ; clés ou agent SSH, pas de mot de passe").size(11).color(theme::MUTED))
+                .push(
+                    row![
+                        input("Serveur SSH", "bastion.exemple.fr", &form.ssh_host, Field::SshHost).width(Fill),
+                        input("Port SSH", "22", &form.ssh_port, Field::SshPort).width(100),
+                        input("Utilisateur SSH", "ubuntu", &form.ssh_user, Field::SshUser).width(Fill),
+                    ]
+                    .spacing(12),
+                )
+                .push(input("Clé privée", "vide = ~/.ssh/id_* ou agent", &form.ssh_key, Field::SshKey))
         }
         Engine::Sqlite => fields.push(input(
             "Fichier",

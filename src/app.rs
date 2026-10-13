@@ -24,6 +24,7 @@ use crate::export::{self, Format};
 use crate::manager::{self, Feedback, Field, Manager};
 use crate::store::{self, ConnectionConfig, Engine, HistoryEntry, Location, SavedQuery};
 use crate::theme;
+use crate::tunnel::Tunnel;
 
 const MONO: Font = Font::MONOSPACE;
 /// Largeur approximative d'un caractère en police mono de 13 px.
@@ -120,6 +121,8 @@ struct Session {
     connector: Arc<dyn Connector>,
     tables: Vec<TableRef>,
     schemas: Vec<String>,
+    /// Tunnel SSH gardé ouvert le temps de la session.
+    _tunnel: Option<Arc<Tunnel>>,
 }
 
 pub struct App {
@@ -172,7 +175,7 @@ pub struct App {
 pub enum Message {
     // Barre latérale
     Connect(u64),
-    Connected(u64, Result<Arc<dyn Connector>>),
+    Connected(u64, Result<(Arc<dyn Connector>, Option<Arc<Tunnel>>)>),
     Disconnect,
     TablesLoaded(Result<Vec<TableRef>>),
     SchemasLoaded(Result<Vec<String>>),
@@ -256,14 +259,25 @@ pub enum Message {
     KeyPressed(Key, Modifiers),
 }
 
-/// Ouvre une connexion : mot de passe depuis le trousseau, puis connecteur.
-async fn open(config: ConnectionConfig, typed_password: Option<String>) -> Result<Arc<dyn Connector>> {
+/// Ouvre une connexion : mot de passe depuis le trousseau, tunnel SSH si
+/// demandé, puis connecteur.
+async fn open(
+    config: ConnectionConfig,
+    typed_password: Option<String>,
+) -> Result<(Arc<dyn Connector>, Option<Arc<Tunnel>>)> {
     let password = match typed_password {
         Some(password) => Some(password),
         None if config.engine.is_server() => store::password(config.id)?,
         None => None,
     };
-    connector::connect(&config, password).await
+    if config.uses_tunnel() {
+        let tunnel = Tunnel::open(&config).await?;
+        // La base est atteinte par le port local du tunnel.
+        let local = ConnectionConfig { host: "127.0.0.1".into(), port: Some(tunnel.local_port), ..config };
+        let connector = connector::connect(&local, password).await?;
+        return Ok((connector, Some(Arc::new(tunnel))));
+    }
+    Ok((connector::connect(&config, password).await?, None))
 }
 
 impl App {
@@ -438,11 +452,21 @@ impl App {
                 self.status = Status::Busy(format!("Connexion à {}…", config.name));
                 return Task::perform(open(config, None), move |r| Message::Connected(id, r));
             }
-            Message::Connected(id, Ok(c)) => {
+            Message::Connected(id, Ok((c, tunnel))) => {
                 self.connecting = None;
-                self.status = Status::Info(format!("Connecté ({})", c.engine()));
+                self.status = Status::Info(format!(
+                    "Connecté ({}){}",
+                    c.engine(),
+                    if tunnel.is_some() { " via tunnel SSH" } else { "" }
+                ));
                 self.persist_tabs();
-                self.session = Some(Session { id, connector: c.clone(), tables: Vec::new(), schemas: Vec::new() });
+                self.session = Some(Session {
+                    id,
+                    connector: c.clone(),
+                    tables: Vec::new(),
+                    schemas: Vec::new(),
+                    _tunnel: tunnel,
+                });
                 self.load_tabs(id);
                 self.selected = None;
                 self.schema.clear();
@@ -797,8 +821,12 @@ impl App {
                 m.feedback = Some(Feedback::Busy("Test en cours…".into()));
                 return Task::perform(
                     async move {
-                        let c = open(config, typed).await?;
-                        Ok(format!("Connexion {} réussie", c.engine()))
+                        let (c, tunnel) = open(config, typed).await?;
+                        Ok(format!(
+                            "Connexion {} réussie{}",
+                            c.engine(),
+                            if tunnel.is_some() { " (via tunnel SSH)" } else { "" }
+                        ))
                     },
                     Message::TestDone,
                 );

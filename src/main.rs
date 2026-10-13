@@ -9,6 +9,7 @@ mod icon;
 mod manager;
 mod store;
 mod theme;
+mod tunnel;
 
 use app::App;
 

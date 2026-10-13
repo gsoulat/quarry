@@ -21,7 +21,7 @@ rust_xlsxwriter = "0.99"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "mysql", "sqlite", "chrono", "uuid", "json"] }
-tokio = { version = "1.53.2", features = ["fs", "rt-multi-thread", "macros"] }
+tokio = { version = "1.53.2", features = ["fs", "rt-multi-thread", "macros", "process", "net", "time", "io-util"] }
 
 # Binaire le plus léger possible en release.
 [profile.release]

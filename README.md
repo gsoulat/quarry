@@ -8,6 +8,7 @@ Client de bases de données léger et multiplateforme (macOS, Linux, Windows), �
 - **Gestionnaire de connexions** (bouton « Gérer ») : ajouter, tester, modifier, supprimer, ranger dans des **dossiers**
 - **Menu « Édition »** : créer / renommer / supprimer une table, ajouter / renommer / supprimer une colonne (types dans un menu déroulant par moteur), insérer / modifier / supprimer une ligne (onglet Données). Le SQL généré est **affiché et confirmé avant exécution**
 - Barre latérale groupée en **Local / Distant / Cloud** : un clic pour se (re)connecter
+- **Tunnel SSH** optionnel (clés ou agent, via le client `ssh` du système)
 - Mots de passe stockés dans le **trousseau du système** (Keychain, Gestionnaire d'identification Windows, Secret Service), jamais en clair sur le disque
 - Tables groupées par schéma, filtre, barre latérale **redimensionnable**, bouton `+` pour **insérer le nom d'une table au curseur**
 - **Schéma** de chaque table (types, NULL, valeurs par défaut, clé primaire)

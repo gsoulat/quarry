@@ -93,6 +93,23 @@ pub struct ConnectionConfig {
     /// défaut de l'application (`gcloud auth application-default login`).
     #[serde(default)]
     pub credentials_path: String,
+    /// Tunnel SSH (vide = connexion directe). `host`/`port` désignent alors
+    /// la base **vue depuis** le serveur SSH.
+    #[serde(default)]
+    pub ssh_host: String,
+    #[serde(default)]
+    pub ssh_port: Option<u16>,
+    #[serde(default)]
+    pub ssh_user: String,
+    /// Chemin d'une clé privée ; vide = clés par défaut ou agent SSH.
+    #[serde(default)]
+    pub ssh_key: String,
+}
+
+impl ConnectionConfig {
+    pub fn uses_tunnel(&self) -> bool {
+        self.engine.is_server() && !self.ssh_host.trim().is_empty()
+    }
 }
 
 impl ConnectionConfig {
@@ -114,7 +131,8 @@ impl ConnectionConfig {
             Engine::BigQuery => self.project_id.clone(),
             Engine::Postgres | Engine::MySql => {
                 let port = self.port.or(self.engine.default_port()).unwrap_or_default();
-                format!("{}:{port}/{}", self.host, self.database)
+                let via = if self.uses_tunnel() { format!(" via ssh {}", self.ssh_host.trim()) } else { String::new() };
+                format!("{}:{port}/{}{via}", self.host, self.database)
             }
         }
     }
@@ -361,6 +379,10 @@ mod tests {
                 path: String::new(),
                 project_id: String::new(),
                 credentials_path: String::new(),
+                ssh_host: String::new(),
+                ssh_port: None,
+                ssh_user: String::new(),
+                ssh_key: String::new(),
             };
             save(std::slice::from_ref(&config)).unwrap();
             let loaded = load().unwrap();
