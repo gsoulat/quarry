@@ -9,7 +9,7 @@ use gcp_bigquery_client::model::table_schema::TableSchema;
 use serde_json::Value;
 
 use super::plan::{PlanNode, QueryPlan};
-use super::{Cell, ColumnInfo, Connector, MAX_ROWS, QueryResult, Result, TableRef};
+use super::{Cell, ColumnInfo, Connector, MAX_ROWS, QueryResult, Relation, Result, TableRef};
 use crate::store::ConnectionConfig;
 
 /// Tarif « à la demande » de BigQuery, en dollars par tébioctet analysé.
@@ -152,6 +152,65 @@ impl Connector for BigQueryConnector {
                 }
             })
             .collect())
+    }
+
+    /// Contraintes déclarées (BigQuery ne les applique pas, mais on peut les
+    /// déclarer). Souvent vide : on ne devine rien d'après les noms.
+    async fn list_relations(&self) -> Result<Vec<Relation>> {
+        let datasets = self
+            .client
+            .dataset()
+            .list(&self.project_id, Default::default())
+            .await
+            .map_err(err)?;
+
+        let mut relations = Vec::new();
+        for dataset in datasets.datasets {
+            let ds = dataset.dataset_reference.dataset_id;
+            let prefix = format!("`{}.{ds}.INFORMATION_SCHEMA", self.project_id);
+            let sql = format!(
+                "SELECT k.constraint_name, k.table_name, k.column_name,
+                        c.table_schema, c.table_name, c.column_name
+                 FROM {prefix}.KEY_COLUMN_USAGE` k
+                 JOIN {prefix}.TABLE_CONSTRAINTS` t
+                   ON t.constraint_name = k.constraint_name AND t.table_name = k.table_name
+                 JOIN {prefix}.CONSTRAINT_COLUMN_USAGE` c
+                   ON c.constraint_name = k.constraint_name
+                 WHERE t.constraint_type = 'FOREIGN KEY'
+                 ORDER BY k.constraint_name, k.ordinal_position"
+            );
+            let result = self.query(&sql).await?;
+
+            let mut current: Option<(String, Relation)> = None;
+            for row in result.rows {
+                let cell = |i: usize| row.get(i).map(Cell::display).unwrap_or_default();
+                let constraint = cell(0);
+                match &mut current {
+                    Some((name, rel)) if *name == constraint => {
+                        rel.from_columns.push(cell(2));
+                        rel.to_columns.push(cell(5));
+                    }
+                    _ => {
+                        if let Some((_, rel)) = current.take() {
+                            relations.push(rel);
+                        }
+                        current = Some((
+                            constraint,
+                            Relation {
+                                from: TableRef { schema: Some(ds.clone()), name: cell(1) },
+                                from_columns: vec![cell(2)],
+                                to: TableRef { schema: Some(cell(3)), name: cell(4) },
+                                to_columns: vec![cell(5)],
+                            },
+                        ));
+                    }
+                }
+            }
+            if let Some((_, rel)) = current {
+                relations.push(rel);
+            }
+        }
+        Ok(relations)
     }
 
     /// BigQuery n'expose son plan détaillé qu'après exécution ; avant, un

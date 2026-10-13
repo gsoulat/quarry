@@ -12,6 +12,7 @@ Client de bases de données léger et multiplateforme (macOS, Linux, Windows), �
 - **Schéma** de chaque table (types, NULL, valeurs par défaut, clé primaire)
 - Éditeur SQL avec coloration, `⌘↩` exécute (la sélection seule si elle existe), `⌘E` explique
 - Grille de résultats paginée (200 lignes par page, 5 000 max), colonnes ajustées au contenu, **clic sur une cellule pour copier**
+- **Diagramme des tables** (onglet Diagramme) : clés étrangères dessinées sur un canvas, zoom et déplacement, boîtes déplaçables, placement automatique, trois niveaux **MPD / MLD / MCD**
 - **Plan d'exécution avant exécution** (`EXPLAIN`, sans `ANALYZE`) : arbre du plan, ordre d'exécution des étapes et coût estimé quand le moteur le fournit
 
 | Moteur | Plan | Coût estimé |
@@ -57,6 +58,7 @@ src/
 ├── manager.rs           fenêtre de gestion des connexions
 ├── store.rs             connexions enregistrées + trousseau
 ├── icon.rs              icône de fenêtre et du Dock
+├── diagram.rs           diagramme des tables (canvas, placement, MPD/MLD/MCD)
 └── connector/
     ├── mod.rs           trait Connector commun à tous les moteurs
     ├── sql.rs           PostgreSQL / MySQL / SQLite via sqlx
@@ -73,10 +75,11 @@ Pour ajouter un moteur (MongoDB/DocumentDB…), il suffit d'implémenter le trai
 - [x] Connexions enregistrées (mots de passe dans le trousseau du système)
 - [ ] Classement local / distant (`store::ConnectionConfig::location`)
 - [ ] Connecteur MongoDB / DocumentDB
-- [ ] Diagramme des relations (MCD / MLD / MPD)
+- [x] Diagramme des relations (MCD / MLD / MPD)
+- [ ] Positions du diagramme mémorisées par connexion
+- [ ] Onglets de requêtes enregistrables
 - [ ] Connecteurs téléchargeables (processus séparés)
 - [ ] Tri et filtre des résultats
 - [ ] Édition des lignes : ajout, modification, suppression
 - [ ] Import de fichiers (CSV, Parquet, Excel) dans une table
-- [ ] Onglets et historique de requêtes
 - [ ] Thème clair

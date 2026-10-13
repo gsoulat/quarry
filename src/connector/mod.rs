@@ -79,6 +79,15 @@ impl Cell {
     }
 }
 
+/// Une clé étrangère : `from.from_columns` référence `to.to_columns`.
+#[derive(Debug, Clone)]
+pub struct Relation {
+    pub from: TableRef,
+    pub from_columns: Vec<String>,
+    pub to: TableRef,
+    pub to_columns: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct QueryResult {
     pub columns: Vec<String>,
@@ -109,6 +118,9 @@ pub trait Connector: Send + Sync + fmt::Debug {
     async fn list_tables(&self) -> Result<Vec<TableRef>>;
 
     async fn describe_table(&self, table: &TableRef) -> Result<Vec<ColumnInfo>>;
+
+    /// Toutes les clés étrangères de la base, pour le diagramme.
+    async fn list_relations(&self) -> Result<Vec<Relation>>;
 
     /// Plan d'exécution estimé, **sans** exécuter la requête.
     async fn explain(&self, sql: &str) -> Result<QueryPlan>;

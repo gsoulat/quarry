@@ -7,14 +7,16 @@ use std::time::{Duration, Instant};
 use iced::keyboard::{self, Key, Modifiers, key::Named};
 use iced::widget::text_editor::{Action, Binding, Edit, KeyPress};
 use iced::widget::{
-    Column, Row, button, column, container, pane_grid, row, scrollable, stack, text, text_editor,
-    text_input, tooltip,
+    Column, Row, button, canvas, column, container, pane_grid, row, scrollable, stack, text,
+    text_editor, text_input, tooltip,
 };
 use iced::{Element, Event, Fill, Font, Length, Subscription, Task, Theme, highlighter, padding};
 
 use crate::connector::{
-    self, ColumnInfo, Connector, QueryPlan, QueryResult, Result, TableRef, execution_order,
+    self, ColumnInfo, Connector, QueryPlan, QueryResult, Relation, Result, TableRef,
+    execution_order,
 };
+use crate::diagram::{self, Diagram};
 use crate::manager::{self, Feedback, Field, Manager};
 use crate::store::{self, ConnectionConfig, Engine, Location};
 use crate::theme;
@@ -32,6 +34,7 @@ pub enum Tab {
     Results,
     Plan,
     Schema,
+    Diagram,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -66,6 +69,10 @@ pub struct App {
     filter: String,
     /// Schémas repliés dans la barre latérale.
     collapsed: HashSet<String>,
+    /// Connexions dont la liste de tables est repliée.
+    folded: HashSet<u64>,
+    diagram: Option<Diagram>,
+    diagram_loading: bool,
     selected: Option<TableRef>,
     schema: Vec<ColumnInfo>,
     editor: text_editor::Content,
@@ -91,7 +98,16 @@ pub enum Message {
     SchemaLoaded(Result<Vec<ColumnInfo>>),
     FilterChanged(String),
     ToggleSchema(String),
+    ToggleFold(u64),
     PaneResized(pane_grid::ResizeEvent),
+
+    // Diagramme
+    LoadDiagram,
+    DiagramLoaded(Result<(Vec<(TableRef, Vec<ColumnInfo>)>, Vec<Relation>)>),
+    DiagramMode(diagram::Mode),
+    DiagramLayout,
+    DiagramFit,
+    DiagramInteraction(diagram::Interaction),
 
     // Gestionnaire de connexions
     OpenManager,
@@ -153,6 +169,9 @@ impl App {
             panes,
             filter: String::new(),
             collapsed: HashSet::new(),
+            folded: HashSet::new(),
+            diagram: None,
+            diagram_loading: false,
             selected: None,
             schema: Vec::new(),
             editor: text_editor::Content::with_text("SELECT 1 AS hello"),
@@ -223,6 +242,8 @@ impl App {
                 self.selected = None;
                 self.schema.clear();
                 self.collapsed.clear();
+                self.folded.remove(&id);
+                self.diagram = None;
                 return Task::perform(async move { c.list_tables().await }, Message::TablesLoaded);
             }
             Message::Connected(_, Err(e)) => {
@@ -233,6 +254,7 @@ impl App {
                 self.session = None;
                 self.selected = None;
                 self.schema.clear();
+                self.diagram = None;
                 self.status = Status::Idle;
             }
             Message::TablesLoaded(Ok(tables)) => {
@@ -270,7 +292,65 @@ impl App {
                     self.collapsed.insert(schema);
                 }
             }
+            Message::ToggleFold(id) => {
+                if !self.folded.remove(&id) {
+                    self.folded.insert(id);
+                }
+            }
             Message::PaneResized(event) => self.panes.resize(event.split, event.ratio),
+
+            Message::LoadDiagram => {
+                let Some(session) = &self.session else { return Task::none() };
+                let c = session.connector.clone();
+                let tables = session.tables.clone();
+                self.diagram_loading = true;
+                self.status = Status::Busy(format!("Lecture de {} tables…", tables.len()));
+                return Task::perform(
+                    async move {
+                        let described = futures_util::future::try_join_all(tables.into_iter().map(|t| {
+                            let c = c.clone();
+                            async move { c.describe_table(&t).await.map(|cols| (t, cols)) }
+                        }))
+                        .await?;
+                        let relations = c.list_relations().await?;
+                        Ok((described, relations))
+                    },
+                    Message::DiagramLoaded,
+                );
+            }
+            Message::DiagramLoaded(Ok((tables, relations))) => {
+                self.diagram_loading = false;
+                self.status = Status::Info(format!(
+                    "{} tables, {} relations",
+                    tables.len(),
+                    relations.len()
+                ));
+                self.diagram = Some(Diagram::new(tables, relations));
+            }
+            Message::DiagramLoaded(Err(e)) => {
+                self.diagram_loading = false;
+                self.status = Status::Error(e);
+            }
+            Message::DiagramMode(mode) => {
+                if let Some(d) = &mut self.diagram {
+                    d.set_mode(mode);
+                }
+            }
+            Message::DiagramLayout => {
+                if let Some(d) = &mut self.diagram {
+                    d.auto_layout();
+                }
+            }
+            Message::DiagramFit => {
+                if let Some(d) = &mut self.diagram {
+                    d.fit();
+                }
+            }
+            Message::DiagramInteraction(interaction) => {
+                if let Some(d) = &mut self.diagram {
+                    d.apply(interaction);
+                }
+            }
 
             Message::OpenManager => {
                 self.manager = Some(match self.active_config() {
@@ -391,7 +471,12 @@ impl App {
                 self.page = 0;
                 self.tab = Tab::Results;
             }
-            Message::TabSelected(tab) => self.tab = tab,
+            Message::TabSelected(tab) => {
+                self.tab = tab;
+                if tab == Tab::Diagram && self.diagram.is_none() && !self.diagram_loading {
+                    return self.update(Message::LoadDiagram);
+                }
+            }
             Message::PageChanged(page) => self.page = page,
             Message::CopyCell(value) => {
                 let preview: String = value.chars().take(40).collect();
@@ -575,6 +660,7 @@ impl App {
             text("○").color(theme::MUTED)
         };
 
+        let folded = self.folded.contains(&config.id);
         let entry = button(
             row![
                 marker.size(10),
@@ -584,17 +670,28 @@ impl App {
                         .size(11)
                         .color(theme::MUTED)
                         .wrapping(text::Wrapping::None),
-                ],
+                ]
+                .width(Fill),
             ]
             .spacing(8)
             .align_y(iced::Center),
         )
-        .on_press(Message::Connect(config.id))
+        .on_press_maybe(session.is_none().then_some(Message::Connect(config.id)))
         .style(theme::list_item(session.is_some()))
         .width(Fill)
         .clip(true);
 
         let Some(session) = session else { return entry.into() };
+
+        // Connexion ouverte : une flèche replie sa liste de tables.
+        let fold = button(text(if folded { "▸" } else { "▾" }).size(12).color(theme::MUTED))
+            .on_press(Message::ToggleFold(config.id))
+            .style(theme::list_item(false))
+            .padding([3, 6]);
+        let entry = row![entry, fold].spacing(2).align_y(iced::Center);
+        if folded {
+            return entry.into();
+        }
 
         let filter = self.filter.trim().to_lowercase();
         let mut by_schema: BTreeMap<String, Vec<&TableRef>> = BTreeMap::new();
@@ -712,6 +809,7 @@ impl App {
             tab("Résultats", Tab::Results),
             tab("Plan d'exécution", Tab::Plan),
             tab("Schéma", Tab::Schema),
+            tab("Diagramme", Tab::Diagram),
         ]
         .spacing(4);
 
@@ -719,6 +817,7 @@ impl App {
             Tab::Results => self.results_view(),
             Tab::Plan => self.plan_view(),
             Tab::Schema => self.schema_view(),
+            Tab::Diagram => self.diagram_view(),
         };
 
         column![
@@ -790,6 +889,65 @@ impl App {
         column![text(table.to_string()).size(15).color(theme::PRIMARY), grid(header, rows)]
             .spacing(8)
             .into()
+    }
+
+    fn diagram_view(&self) -> Element<'_, Message> {
+        if self.session.is_none() {
+            return hint("Ouvre une connexion pour voir le diagramme de ses tables.");
+        }
+        let Some(d) = &self.diagram else {
+            return if self.diagram_loading {
+                hint("Lecture des tables et des relations…")
+            } else {
+                container(
+                    button(text("Charger le diagramme").size(13))
+                        .on_press(Message::LoadDiagram)
+                        .padding([6, 14]),
+                )
+                .center(Fill)
+                .into()
+            };
+        };
+
+        let mode = |m: diagram::Mode| {
+            button(text(m.label()).size(12))
+                .on_press(Message::DiagramMode(m))
+                .style(theme::list_item(d.mode == m))
+                .padding([3, 10])
+        };
+        let tool = |label, message| {
+            button(text(label).size(12))
+                .on_press(message)
+                .style(button::secondary)
+                .padding([3, 10])
+        };
+        let modes = Row::with_children(diagram::Mode::ALL.map(|m| mode(m).into())).spacing(4);
+        let toolbar = row![
+            modes,
+            text(d.mode.description()).size(12).color(theme::MUTED).width(Fill),
+            tool("Réorganiser", Message::DiagramLayout),
+            tool("Ajuster", Message::DiagramFit),
+            tool("Recharger", Message::LoadDiagram),
+        ]
+        .spacing(6)
+        .align_y(iced::Center);
+
+        let mut info = Vec::new();
+        if d.relations.is_empty() {
+            info.push("Aucune clé étrangère déclarée : les tables s'affichent sans liens.");
+        }
+        let hint_text = text(if info.is_empty() {
+            "Molette : zoom · glisser le fond : déplacer · glisser une boîte : la ranger"
+        } else {
+            info[0]
+        })
+        .size(11)
+        .color(theme::MUTED);
+
+        let canvas = canvas(d).width(Fill).height(Fill);
+        let canvas = Element::from(canvas).map(Message::DiagramInteraction);
+
+        column![toolbar, hint_text, canvas].spacing(6).into()
     }
 
     fn plan_view(&self) -> Element<'_, Message> {

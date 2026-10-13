@@ -9,7 +9,7 @@ async-trait = "0.1.92"
 directories = "6"
 futures-util = "0.3.34"
 gcp-bigquery-client = { version = "0.28", optional = true }
-iced = { version = "0.14", features = ["highlighter", "tokio"] }
+iced = { version = "0.14", features = ["canvas", "highlighter", "tokio"] }
 keyring = "4"
 png = "0.18.1"
 serde = { version = "1.0.229", features = ["derive"] }

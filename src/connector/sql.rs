@@ -10,7 +10,7 @@ use sqlx::types::{JsonValue, Uuid};
 use sqlx::{AssertSqlSafe, Column, Row, TypeInfo, ValueRef};
 
 use super::plan::{self, QueryPlan};
-use super::{Cell, ColumnInfo, Connector, MAX_ROWS, QueryResult, Result, TableRef};
+use super::{Cell, ColumnInfo, Connector, MAX_ROWS, QueryResult, Relation, Result, TableRef};
 use crate::store::{ConnectionConfig, Engine};
 
 /// Peu de connexions suffisent pour un client interactif.
@@ -283,6 +283,110 @@ impl Connector for SqlConnector {
         }
     }
 
+    async fn list_relations(&self) -> Result<Vec<Relation>> {
+        match self {
+            Self::Postgres(pool) => {
+                let rows: Vec<(String, String, Vec<String>, String, String, Vec<String>)> =
+                    sqlx::query_as(
+                        "SELECT n.nspname::text, c.relname::text,
+                                array_agg(a.attname::text ORDER BY k.ord),
+                                fn.nspname::text, fc.relname::text,
+                                array_agg(fa.attname::text ORDER BY k.ord)
+                         FROM pg_constraint con
+                         JOIN pg_class c ON c.oid = con.conrelid
+                         JOIN pg_namespace n ON n.oid = c.relnamespace
+                         JOIN pg_class fc ON fc.oid = con.confrelid
+                         JOIN pg_namespace fn ON fn.oid = fc.relnamespace
+                         CROSS JOIN LATERAL unnest(con.conkey, con.confkey)
+                             WITH ORDINALITY AS k(attnum, fattnum, ord)
+                         JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum
+                         JOIN pg_attribute fa ON fa.attrelid = fc.oid AND fa.attnum = k.fattnum
+                         WHERE con.contype = 'f'
+                         GROUP BY con.oid, n.nspname, c.relname, fn.nspname, fc.relname
+                         ORDER BY 1, 2",
+                    )
+                    .fetch_all(pool)
+                    .await
+                    .map_err(err)?;
+                Ok(rows
+                    .into_iter()
+                    .map(|(schema, name, cols, to_schema, to_name, to_cols)| Relation {
+                        from: TableRef { schema: Some(schema), name },
+                        from_columns: cols,
+                        to: TableRef { schema: Some(to_schema), name: to_name },
+                        to_columns: to_cols,
+                    })
+                    .collect())
+            }
+            Self::MySql(pool) => {
+                let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+                    "SELECT CAST(table_name AS CHAR),
+                            CAST(GROUP_CONCAT(column_name ORDER BY ordinal_position SEPARATOR ',') AS CHAR),
+                            CAST(referenced_table_name AS CHAR),
+                            CAST(GROUP_CONCAT(referenced_column_name ORDER BY ordinal_position SEPARATOR ',') AS CHAR)
+                     FROM information_schema.key_column_usage
+                     WHERE table_schema = DATABASE() AND referenced_table_name IS NOT NULL
+                     GROUP BY constraint_name, table_name, referenced_table_name
+                     ORDER BY 1",
+                )
+                .fetch_all(pool)
+                .await
+                .map_err(err)?;
+                let split = |s: String| s.split(',').map(str::to_owned).collect();
+                Ok(rows
+                    .into_iter()
+                    .map(|(name, cols, to_name, to_cols)| Relation {
+                        from: TableRef { schema: None, name },
+                        from_columns: split(cols),
+                        to: TableRef { schema: None, name: to_name },
+                        to_columns: split(to_cols),
+                    })
+                    .collect())
+            }
+            Self::Sqlite(pool) => {
+                let mut relations = Vec::new();
+                for table in self.list_tables().await? {
+                    let rows: Vec<(i64, String, String, Option<String>)> = sqlx::query_as(
+                        "SELECT id, \"from\", \"table\", \"to\"
+                         FROM pragma_foreign_key_list(?) ORDER BY id, seq",
+                    )
+                    .bind(&table.name)
+                    .fetch_all(pool)
+                    .await
+                    .map_err(err)?;
+                    // Une clé composite donne plusieurs lignes avec le même id.
+                    let mut current: Option<(i64, Relation)> = None;
+                    for (id, from_col, to_name, to_col) in rows {
+                        match &mut current {
+                            Some((cur_id, rel)) if *cur_id == id => {
+                                rel.from_columns.push(from_col);
+                                rel.to_columns.push(to_col.unwrap_or_default());
+                            }
+                            _ => {
+                                if let Some((_, rel)) = current.take() {
+                                    relations.push(rel);
+                                }
+                                current = Some((
+                                    id,
+                                    Relation {
+                                        from: table.clone(),
+                                        from_columns: vec![from_col],
+                                        to: TableRef { schema: None, name: to_name },
+                                        to_columns: vec![to_col.unwrap_or_default()],
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                    if let Some((_, rel)) = current {
+                        relations.push(rel);
+                    }
+                }
+                Ok(relations)
+            }
+        }
+    }
+
     async fn explain(&self, sql: &str) -> Result<QueryPlan> {
         // Aucun de ces EXPLAIN n'exécute la requête (pas d'ANALYZE).
         match self {
@@ -366,5 +470,12 @@ mod tests {
             .unwrap();
         assert!(!plan.nodes.is_empty());
         assert_eq!(plan.total_cost, None);
+
+        let relations = c.list_relations().await.unwrap();
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0].from.name, "orders");
+        assert_eq!(relations[0].from_columns, ["user_id"]);
+        assert_eq!(relations[0].to.name, "users");
+        assert_eq!(relations[0].to_columns, ["id"]);
     }
 }

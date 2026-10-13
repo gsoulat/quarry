@@ -1,5 +1,6 @@
 mod app;
 mod connector;
+mod diagram;
 mod icon;
 mod manager;
 mod store;
