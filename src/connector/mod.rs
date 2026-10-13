@@ -1,8 +1,10 @@
 //! Couche d'accès aux bases : un trait commun que chaque moteur implémente.
 //!
-//! L'interface ne connaît que [`Connector`] ; ajouter un moteur (BigQuery,
-//! MongoDB…) revient à écrire un nouveau module qui implémente ce trait.
+//! L'interface ne connaît que [`Connector`] ; ajouter un moteur (MongoDB…)
+//! revient à écrire un nouveau module qui implémente ce trait.
 
+#[cfg(feature = "bigquery")]
+mod bigquery;
 mod plan;
 mod sql;
 
@@ -12,6 +14,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 pub use plan::{QueryPlan, execution_order};
+
+use crate::store::{ConnectionConfig, Engine};
+
+/// Au-delà, on arrête de lire : la grille reste fluide et la mémoire basse.
+pub const MAX_ROWS: usize = 5_000;
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -109,15 +116,18 @@ pub trait Connector: Send + Sync + fmt::Debug {
     async fn query(&self, sql: &str) -> Result<QueryResult>;
 }
 
-/// Ouvre une connexion en choisissant le moteur d'après le schéma de l'URL.
-pub async fn connect(url: &str) -> Result<Arc<dyn Connector>> {
-    let scheme = url.split("://").next().unwrap_or_default();
-    match scheme {
-        "postgres" | "postgresql" | "mysql" | "sqlite" => {
-            let connector = sql::SqlConnector::connect(url).await?;
-            Ok(Arc::new(connector))
+/// Ouvre une connexion enregistrée, avec son mot de passe éventuel.
+pub async fn connect(
+    config: &ConnectionConfig,
+    password: Option<String>,
+) -> Result<Arc<dyn Connector>> {
+    match config.engine {
+        Engine::Postgres | Engine::MySql | Engine::Sqlite => {
+            Ok(Arc::new(sql::SqlConnector::connect(config, password.as_deref()).await?))
         }
-        "" => Err("URL de connexion vide".into()),
-        other => Err(format!("Moteur non supporté : « {other} »")),
+        #[cfg(feature = "bigquery")]
+        Engine::BigQuery => Ok(Arc::new(bigquery::BigQueryConnector::connect(config).await?)),
+        #[cfg(not(feature = "bigquery"))]
+        Engine::BigQuery => Err("Quarry a été compilé sans la fonctionnalité « bigquery »".into()),
     }
 }

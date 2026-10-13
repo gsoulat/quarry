@@ -24,6 +24,8 @@ pub struct QueryPlan {
     pub total_cost: Option<f64>,
     /// Unité du coût : chaque moteur a son échelle, non comparable aux autres.
     pub cost_unit: &'static str,
+    /// Précision affichée sous le coût (limites de l'estimation…).
+    pub note: Option<String>,
 }
 
 /// Renvoie les indices de `nodes` dans l'ordre où le moteur les exécute.
@@ -53,6 +55,7 @@ pub fn from_postgres_json(value: &Value) -> Result<QueryPlan, String> {
         total_cost: root.get("Total Cost").and_then(Value::as_f64),
         nodes,
         cost_unit: "unités PostgreSQL",
+        note: None,
     })
 }
 
@@ -107,6 +110,7 @@ pub fn from_mysql_tree(text: &str) -> QueryPlan {
         total_cost: nodes.first().and_then(|n| n.cost),
         nodes,
         cost_unit: "unités MySQL",
+        note: None,
     }
 }
 
@@ -123,7 +127,7 @@ pub fn from_sqlite(rows: &[(i64, i64, String)]) -> QueryPlan {
         })
         .collect();
 
-    QueryPlan { nodes, total_cost: None, cost_unit: "" }
+    QueryPlan { nodes, total_cost: None, cost_unit: "", note: None }
 }
 
 /// Lit le nombre qui suit `key` ; pour une plage `a..b`, garde `b`.

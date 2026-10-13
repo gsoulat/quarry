@@ -2,18 +2,17 @@
 
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
-use sqlx::mysql::{MySqlPool, MySqlPoolOptions, MySqlRow};
-use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
-use sqlx::sqlite::{SqlitePool, SqlitePoolOptions, SqliteRow};
+use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlRow};
+use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgRow};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions, SqliteRow};
 use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use sqlx::types::{JsonValue, Uuid};
 use sqlx::{AssertSqlSafe, Column, Row, TypeInfo, ValueRef};
 
 use super::plan::{self, QueryPlan};
-use super::{Cell, ColumnInfo, Connector, QueryResult, Result, TableRef};
+use super::{Cell, ColumnInfo, Connector, MAX_ROWS, QueryResult, Result, TableRef};
+use crate::store::{ConnectionConfig, Engine};
 
-/// Au-delà, on arrête de lire : la grille reste fluide et la mémoire basse.
-const MAX_ROWS: usize = 5_000;
 /// Peu de connexions suffisent pour un client interactif.
 const MAX_CONNECTIONS: u32 = 4;
 
@@ -29,16 +28,47 @@ fn err(e: sqlx::Error) -> String {
 }
 
 impl SqlConnector {
-    pub async fn connect(url: &str) -> Result<Self> {
-        if url.starts_with("postgres") {
-            let pool = PgPoolOptions::new().max_connections(MAX_CONNECTIONS);
-            Ok(Self::Postgres(pool.connect(url).await.map_err(err)?))
-        } else if url.starts_with("mysql") {
-            let pool = MySqlPoolOptions::new().max_connections(MAX_CONNECTIONS);
-            Ok(Self::MySql(pool.connect(url).await.map_err(err)?))
-        } else {
-            let pool = SqlitePoolOptions::new().max_connections(MAX_CONNECTIONS);
-            Ok(Self::Sqlite(pool.connect(url).await.map_err(err)?))
+    /// Les options sont construites champ par champ plutôt que via une URL :
+    /// un mot de passe contenant `@` ou `/` n'a pas besoin d'être échappé.
+    pub async fn connect(config: &ConnectionConfig, password: Option<&str>) -> Result<Self> {
+        let port = config.port.or(config.engine.default_port()).unwrap_or_default();
+        let database = (!config.database.is_empty()).then_some(config.database.as_str());
+
+        match config.engine {
+            Engine::Postgres => {
+                let mut options =
+                    PgConnectOptions::new().host(&config.host).port(port).username(&config.user);
+                if let Some(password) = password {
+                    options = options.password(password);
+                }
+                if let Some(database) = database {
+                    options = options.database(database);
+                }
+                let pool = PgPoolOptions::new().max_connections(MAX_CONNECTIONS);
+                Ok(Self::Postgres(pool.connect_with(options).await.map_err(err)?))
+            }
+            Engine::MySql => {
+                let mut options =
+                    MySqlConnectOptions::new().host(&config.host).port(port).username(&config.user);
+                if let Some(password) = password {
+                    options = options.password(password);
+                }
+                if let Some(database) = database {
+                    options = options.database(database);
+                }
+                let pool = MySqlPoolOptions::new().max_connections(MAX_CONNECTIONS);
+                Ok(Self::MySql(pool.connect_with(options).await.map_err(err)?))
+            }
+            Engine::Sqlite => {
+                if config.path.trim().is_empty() {
+                    return Err("Chemin du fichier SQLite manquant".into());
+                }
+                let options =
+                    SqliteConnectOptions::new().filename(&config.path).create_if_missing(true);
+                let pool = SqlitePoolOptions::new().max_connections(MAX_CONNECTIONS);
+                Ok(Self::Sqlite(pool.connect_with(options).await.map_err(err)?))
+            }
+            Engine::BigQuery => Err("BigQuery n'est pas un moteur sqlx".into()),
         }
     }
 }

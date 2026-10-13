@@ -4,13 +4,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use iced::widget::{
-    Column, Row, button, column, container, row, scrollable, text, text_editor, text_input,
+    Column, Row, button, column, container, row, scrollable, stack, text, text_editor,
 };
 use iced::{Element, Fill, Font, Length, Task, Theme, padding};
 
 use crate::connector::{
     self, ColumnInfo, Connector, QueryPlan, QueryResult, Result, TableRef, execution_order,
 };
+use crate::manager::{self, Feedback, Field, Manager};
+use crate::store::{self, ConnectionConfig, Engine, Location};
 use crate::theme;
 
 const CELL_WIDTH: f32 = 180.0;
@@ -26,15 +28,24 @@ pub enum Tab {
 #[derive(Debug, Clone)]
 enum Status {
     Idle,
-    Busy(&'static str),
+    Busy(String),
     Info(String),
     Error(String),
 }
 
-pub struct App {
-    url: String,
-    connector: Option<Arc<dyn Connector>>,
+/// La connexion ouverte et ce qu'on en a chargé.
+struct Session {
+    id: u64,
+    connector: Arc<dyn Connector>,
     tables: Vec<TableRef>,
+}
+
+pub struct App {
+    connections: Vec<ConnectionConfig>,
+    session: Option<Session>,
+    /// Connexion en cours d'ouverture (pour l'indicateur dans la barre latérale).
+    connecting: Option<u64>,
+    manager: Option<Manager>,
     selected: Option<TableRef>,
     schema: Vec<ColumnInfo>,
     editor: text_editor::Content,
@@ -46,12 +57,26 @@ pub struct App {
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    UrlChanged(String),
-    Connect,
-    Connected(Result<Arc<dyn Connector>>),
+    // Barre latérale
+    Connect(u64),
+    Connected(u64, Result<Arc<dyn Connector>>),
+    Disconnect,
     TablesLoaded(Result<Vec<TableRef>>),
     TableSelected(TableRef),
     SchemaLoaded(Result<Vec<ColumnInfo>>),
+
+    // Gestionnaire de connexions
+    OpenManager,
+    CloseManager,
+    EditConnection(Option<u64>),
+    FormChanged(Field, String),
+    FormEngine(Engine),
+    TestConnection,
+    TestDone(Result<String>),
+    SaveConnection { connect: bool },
+    DeleteConnection,
+
+    // Espace de travail
     Edit(text_editor::Action),
     Explain,
     Explained(Result<QueryPlan>),
@@ -60,25 +85,45 @@ pub enum Message {
     TabSelected(Tab),
 }
 
+/// Ouvre une connexion : mot de passe depuis le trousseau, puis connecteur.
+async fn open(config: ConnectionConfig, typed_password: Option<String>) -> Result<Arc<dyn Connector>> {
+    let password = match typed_password {
+        Some(password) => Some(password),
+        None if config.engine.is_server() => store::password(config.id)?,
+        None => None,
+    };
+    connector::connect(&config, password).await
+}
+
 impl App {
     pub fn new() -> Self {
+        crate::icon::set_dock_icon();
+
+        let (connections, status) = match store::load() {
+            Ok(connections) => (connections, Status::Idle),
+            Err(e) => (Vec::new(), Status::Error(e)),
+        };
+        // Premier lancement : on ouvre directement le gestionnaire.
+        let manager = connections.is_empty().then(Manager::new);
+
         Self {
-            url: "sqlite://demo.db?mode=rwc".into(),
-            connector: None,
-            tables: Vec::new(),
+            connections,
+            session: None,
+            connecting: None,
+            manager,
             selected: None,
             schema: Vec::new(),
             editor: text_editor::Content::with_text("SELECT 1 AS hello"),
             result: None,
             plan: None,
             tab: Tab::Results,
-            status: Status::Idle,
+            status,
         }
     }
 
     pub fn title(&self) -> String {
-        match &self.connector {
-            Some(c) => format!("Quarry — {}", c.engine()),
+        match self.active_config() {
+            Some(c) => format!("Quarry — {}", c.name),
             None => "Quarry".into(),
         }
     }
@@ -87,26 +132,50 @@ impl App {
         theme::quarry()
     }
 
+    fn active_config(&self) -> Option<&ConnectionConfig> {
+        let id = self.session.as_ref()?.id;
+        self.connections.iter().find(|c| c.id == id)
+    }
+
+    fn connector(&self) -> Option<Arc<dyn Connector>> {
+        self.session.as_ref().map(|s| s.connector.clone())
+    }
+
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::UrlChanged(url) => self.url = url,
-
-            Message::Connect => {
-                self.status = Status::Busy("Connexion…");
-                let url = self.url.trim().to_owned();
-                return Task::perform(async move { connector::connect(&url).await }, Message::Connected);
+            Message::Connect(id) => {
+                let Some(config) = self.connections.iter().find(|c| c.id == id).cloned() else {
+                    return Task::none();
+                };
+                self.connecting = Some(id);
+                self.status = Status::Busy(format!("Connexion à {}…", config.name));
+                return Task::perform(open(config, None), move |r| Message::Connected(id, r));
             }
-            Message::Connected(Ok(c)) => {
-                self.status = Status::Info(format!("Connecté à {}", c.engine()));
-                self.connector = Some(c.clone());
-                self.tables.clear();
+            Message::Connected(id, Ok(c)) => {
+                self.connecting = None;
+                self.status = Status::Info(format!("Connecté ({})", c.engine()));
+                self.session = Some(Session { id, connector: c.clone(), tables: Vec::new() });
                 self.selected = None;
+                self.schema.clear();
                 return Task::perform(async move { c.list_tables().await }, Message::TablesLoaded);
             }
-            Message::TablesLoaded(Ok(tables)) => self.tables = tables,
-
+            Message::Connected(_, Err(e)) => {
+                self.connecting = None;
+                self.status = Status::Error(e);
+            }
+            Message::Disconnect => {
+                self.session = None;
+                self.selected = None;
+                self.schema.clear();
+                self.status = Status::Idle;
+            }
+            Message::TablesLoaded(Ok(tables)) => {
+                if let Some(session) = &mut self.session {
+                    session.tables = tables;
+                }
+            }
             Message::TableSelected(table) => {
-                let Some(c) = self.connector.clone() else { return Task::none() };
+                let Some(c) = self.connector() else { return Task::none() };
                 self.editor = text_editor::Content::with_text(&c.preview_sql(&table));
                 self.selected = Some(table.clone());
                 self.tab = Tab::Schema;
@@ -117,11 +186,76 @@ impl App {
             }
             Message::SchemaLoaded(Ok(columns)) => self.schema = columns,
 
-            Message::Edit(action) => self.editor.perform(action),
+            Message::OpenManager => {
+                self.manager = Some(match self.active_config() {
+                    Some(config) => Manager::edit(config),
+                    None => Manager::new(),
+                });
+            }
+            Message::CloseManager => self.manager = None,
+            Message::EditConnection(id) => {
+                let config = id.and_then(|id| self.connections.iter().find(|c| c.id == id));
+                self.manager = Some(config.map_or_else(Manager::new, Manager::edit));
+            }
+            Message::FormChanged(field, value) => {
+                if let Some(m) = &mut self.manager {
+                    m.form.set(field, value);
+                }
+            }
+            Message::FormEngine(engine) => {
+                if let Some(m) = &mut self.manager {
+                    m.form.set_engine(engine);
+                }
+            }
+            Message::TestConnection => {
+                let Some(m) = &mut self.manager else { return Task::none() };
+                let config = match m.form.to_config(m.editing.unwrap_or(0)) {
+                    Ok(config) => config,
+                    Err(e) => {
+                        m.feedback = Some(Feedback::Error(e));
+                        return Task::none();
+                    }
+                };
+                let typed = (!m.form.password.is_empty()).then(|| m.form.password.clone());
+                m.feedback = Some(Feedback::Busy("Test en cours…".into()));
+                return Task::perform(
+                    async move {
+                        let c = open(config, typed).await?;
+                        Ok(format!("Connexion {} réussie", c.engine()))
+                    },
+                    Message::TestDone,
+                );
+            }
+            Message::TestDone(result) => {
+                if let Some(m) = &mut self.manager {
+                    m.feedback = Some(match result {
+                        Ok(msg) => Feedback::Ok(msg),
+                        Err(e) => Feedback::Error(e),
+                    });
+                }
+            }
+            Message::SaveConnection { connect } => return self.save_connection(connect),
+            Message::DeleteConnection => {
+                let Some(id) = self.manager.as_ref().and_then(|m| m.editing) else {
+                    return Task::none();
+                };
+                self.connections.retain(|c| c.id != id);
+                if self.session.as_ref().is_some_and(|s| s.id == id) {
+                    self.session = None;
+                }
+                let result = store::delete_password(id).and(store::save(&self.connections));
+                let mut manager = Manager::new();
+                manager.feedback = Some(match result {
+                    Ok(()) => Feedback::Ok("Connexion supprimée".into()),
+                    Err(e) => Feedback::Error(e),
+                });
+                self.manager = Some(manager);
+            }
 
+            Message::Edit(action) => self.editor.perform(action),
             Message::Explain => {
-                let Some(c) = self.connector.clone() else { return Task::none() };
-                self.status = Status::Busy("Analyse du plan…");
+                let Some(c) = self.connector() else { return Task::none() };
+                self.status = Status::Busy("Analyse du plan…".into());
                 let sql = self.editor.text();
                 return Task::perform(async move { c.explain(&sql).await }, Message::Explained);
             }
@@ -130,10 +264,9 @@ impl App {
                 self.plan = Some(plan);
                 self.tab = Tab::Plan;
             }
-
             Message::Run => {
-                let Some(c) = self.connector.clone() else { return Task::none() };
-                self.status = Status::Busy("Exécution…");
+                let Some(c) = self.connector() else { return Task::none() };
+                self.status = Status::Busy("Exécution…".into());
                 let sql = self.editor.text();
                 return Task::perform(
                     async move {
@@ -153,11 +286,9 @@ impl App {
                 self.result = Some(result);
                 self.tab = Tab::Results;
             }
-
             Message::TabSelected(tab) => self.tab = tab,
 
-            Message::Connected(Err(e))
-            | Message::TablesLoaded(Err(e))
+            Message::TablesLoaded(Err(e))
             | Message::SchemaLoaded(Err(e))
             | Message::Explained(Err(e))
             | Message::QueryDone(Err(e), _) => self.status = Status::Error(e),
@@ -165,57 +296,170 @@ impl App {
         Task::none()
     }
 
+    fn save_connection(&mut self, connect: bool) -> Task<Message> {
+        let Some(m) = &mut self.manager else { return Task::none() };
+        let id = m
+            .editing
+            .unwrap_or_else(|| self.connections.iter().map(|c| c.id).max().unwrap_or(0) + 1);
+
+        let config = match m.form.to_config(id) {
+            Ok(config) => config,
+            Err(e) => {
+                m.feedback = Some(Feedback::Error(e));
+                return Task::none();
+            }
+        };
+
+        let mut result = Ok(());
+        if config.engine.is_server() && !m.form.password.is_empty() {
+            result = store::set_password(id, &m.form.password);
+        }
+        match self.connections.iter_mut().find(|c| c.id == id) {
+            Some(existing) => *existing = config,
+            None => self.connections.push(config),
+        }
+        let result = result.and(store::save(&self.connections));
+
+        m.editing = Some(id);
+        m.form.password.clear();
+        m.feedback = Some(match &result {
+            Ok(()) => Feedback::Ok("Connexion enregistrée".into()),
+            Err(e) => Feedback::Error(e.clone()),
+        });
+
+        if connect && result.is_ok() {
+            self.manager = None;
+            return self.update(Message::Connect(id));
+        }
+        Task::none()
+    }
+
     pub fn view(&self) -> Element<'_, Message> {
         let body = row![self.sidebar(), self.workspace()].spacing(12).height(Fill);
-        column![self.top_bar(), body].spacing(12).padding(12).into()
+        let base = column![self.top_bar(), body].spacing(12).padding(12);
+
+        match &self.manager {
+            Some(m) => stack![base, manager::view(m, &self.connections)].into(),
+            None => base.into(),
+        }
     }
 
     fn top_bar(&self) -> Element<'_, Message> {
-        let url = text_input("postgres://user:pass@localhost/db", &self.url)
-            .on_input(Message::UrlChanged)
-            .on_submit(Message::Connect)
-            .font(MONO)
-            .padding(8);
-
         let (label, color) = match &self.status {
             Status::Idle => (String::new(), theme::MUTED),
-            Status::Busy(msg) => (msg.to_string(), theme::WARNING),
+            Status::Busy(msg) => (msg.clone(), theme::WARNING),
             Status::Info(msg) => (msg.clone(), theme::SUCCESS),
             Status::Error(msg) => (msg.clone(), theme::DANGER),
         };
 
+        let active = match self.active_config() {
+            Some(c) => row![
+                text(&c.name).size(14).color(theme::TEXT),
+                text(c.summary()).size(12).font(MONO).color(theme::MUTED),
+                button(text("Déconnecter").size(12))
+                    .on_press(Message::Disconnect)
+                    .style(button::text),
+            ]
+            .spacing(10)
+            .align_y(iced::Center),
+            None => row![text("Aucune connexion").size(14).color(theme::MUTED)],
+        };
+
         row![
             text("Quarry").size(20).color(theme::PRIMARY),
-            url,
-            button("Connexion").on_press(Message::Connect).padding([8, 16]),
-            container(text(label).size(13).color(color)).max_width(420),
+            container(active).width(Fill),
+            container(text(label).size(13).color(color)).max_width(520),
         ]
-        .spacing(12)
+        .spacing(16)
         .align_y(iced::Center)
         .into()
     }
 
     fn sidebar(&self) -> Element<'_, Message> {
-        let items = self.tables.iter().map(|table| {
+        let mut list = Column::new().spacing(2);
+
+        for location in Location::ALL {
+            let group: Vec<_> =
+                self.connections.iter().filter(|c| c.location() == location).collect();
+            if group.is_empty() {
+                continue;
+            }
+            list = list.push(
+                container(text(location.label()).size(11).color(theme::MUTED))
+                    .padding(padding::top(10).bottom(4)),
+            );
+            for config in group {
+                list = list.push(self.connection_entry(config));
+            }
+        }
+
+        if self.connections.is_empty() {
+            list = list.push(text("Aucune connexion enregistrée.").size(13).color(theme::MUTED));
+        }
+
+        let header = row![
+            text("CONNEXIONS").size(11).color(theme::MUTED).width(Fill),
+            button(text("Gérer").size(12)).on_press(Message::OpenManager).style(button::text),
+        ]
+        .align_y(iced::Center);
+
+        container(column![header, scrollable(list).height(Fill)].spacing(4))
+            .style(theme::panel)
+            .padding(10)
+            .width(260)
+            .height(Fill)
+            .into()
+    }
+
+    /// Une connexion ; si elle est ouverte, ses tables s'affichent dessous.
+    fn connection_entry<'a>(&'a self, config: &'a ConnectionConfig) -> Element<'a, Message> {
+        let session = self.session.as_ref().filter(|s| s.id == config.id);
+        let marker = if session.is_some() {
+            text("●").color(theme::SUCCESS)
+        } else if self.connecting == Some(config.id) {
+            text("●").color(theme::WARNING)
+        } else {
+            text("○").color(theme::MUTED)
+        };
+
+        let entry = button(
+            row![
+                marker.size(10),
+                column![
+                    text(&config.name).size(13),
+                    text(format!("{} · {}", config.engine, config.summary()))
+                        .size(11)
+                        .color(theme::MUTED),
+                ],
+            ]
+            .spacing(8)
+            .align_y(iced::Center),
+        )
+        .on_press(Message::Connect(config.id))
+        .style(theme::list_item(session.is_some()))
+        .width(Fill);
+
+        let Some(session) = session else { return entry.into() };
+
+        let tables = session.tables.iter().map(|table| {
             let active = self.selected.as_ref() == Some(table);
-            button(text(table.to_string()).size(13))
+            button(text(table.to_string()).size(12).font(MONO))
                 .on_press(Message::TableSelected(table.clone()))
                 .style(theme::list_item(active))
                 .width(Fill)
                 .into()
         });
 
-        let content = column![
-            text(format!("TABLES ({})", self.tables.len())).size(11).color(theme::MUTED),
-            scrollable(Column::with_children(items).spacing(2)).height(Fill),
+        column![
+            entry,
+            container(Column::with_children(tables).spacing(1)).padding(padding::left(18)),
         ]
-        .spacing(8);
-
-        container(content).style(theme::panel).padding(10).width(240).height(Fill).into()
+        .spacing(2)
+        .into()
     }
 
     fn workspace(&self) -> Element<'_, Message> {
-        let connected = self.connector.is_some();
+        let connected = self.session.is_some();
 
         let editor = text_editor(&self.editor)
             .on_action(Message::Edit)
@@ -327,14 +571,15 @@ impl App {
             text(format!("{}. {}", step + 1, plan.nodes[i].label)).font(MONO).size(13).into()
         });
 
-        let content = column![
-            text(total).size(15).color(theme::PRIMARY),
-            section("ARBRE DU PLAN"),
-            Column::with_children(tree).spacing(4),
-            section("ORDRE D'EXÉCUTION"),
-            Column::with_children(order).spacing(4),
-        ]
-        .spacing(10);
+        let mut content = column![text(total).size(15).color(theme::PRIMARY)].spacing(10);
+        if let Some(note) = &plan.note {
+            content = content.push(text(note).size(12).color(theme::MUTED));
+        }
+        let content = content
+            .push(section("ARBRE DU PLAN"))
+            .push(Column::with_children(tree).spacing(4))
+            .push(section("ORDRE D'EXÉCUTION"))
+            .push(Column::with_children(order).spacing(4));
 
         scrollable(content).height(Fill).into()
     }
