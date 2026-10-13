@@ -1,6 +1,6 @@
 [package]
 name = "quarry"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 description = "Client de bases de données léger et multiplateforme, écrit en Rust avec iced"
 

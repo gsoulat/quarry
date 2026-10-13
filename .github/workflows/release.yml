@@ -98,6 +98,12 @@ jobs:
           cargo install cargo-bundle --locked
           cargo bundle --release --target ${{ matrix.target }}
           cd target/${{ matrix.target }}/release/bundle/osx
+          # Signature ad hoc du bundle entier : sans elle, seul le binaire porte
+          # la signature posée par l'éditeur de liens, les ressources et
+          # Info.plist ne sont pas scellés et Gatekeeper affiche
+          # « Quarry est endommagé » au lieu de proposer d'ouvrir quand même.
+          codesign --force --deep --sign - Quarry.app
+          codesign --verify --deep --strict --verbose=2 Quarry.app
           ditto -c -k --keepParent Quarry.app "${{ matrix.archive }}"
           mv "${{ matrix.archive }}" "$GITHUB_WORKSPACE/"
 
@@ -141,8 +147,10 @@ jobs:
           body: |
             ## Installation
 
-            - **macOS** : dézippe, glisse `Quarry.app` dans Applications. L'application n'est pas signée par Apple :
-              au premier lancement, clic droit → Ouvrir (ou Réglages → Confidentialité et sécurité → Ouvrir quand même).
+            - **macOS** : dézippe, glisse `Quarry.app` dans Applications. L'application n'est pas notariée par Apple :
+              au premier lancement macOS refuse de l'ouvrir ; va dans Réglages Système → Confidentialité et sécurité,
+              puis clique « Ouvrir quand même » en bas de la page. En alternative, dans le Terminal :
+              `xattr -dr com.apple.quarantine /Applications/Quarry.app`.
             - **Linux** : `tar xzf` puis lance `./quarry`.
             - **Windows** : dézippe et lance `Quarry.exe`. SmartScreen peut demander confirmation (exécutable non signé).
 
