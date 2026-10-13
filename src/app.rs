@@ -1,12 +1,16 @@
 //! État de l'application, messages et vues (architecture Elm d'iced).
 
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use iced::keyboard::{self, Key, Modifiers, key::Named};
+use iced::widget::text_editor::{Action, Binding, Edit, KeyPress};
 use iced::widget::{
-    Column, Row, button, column, container, row, scrollable, stack, text, text_editor,
+    Column, Row, button, column, container, pane_grid, row, scrollable, stack, text, text_editor,
+    text_input, tooltip,
 };
-use iced::{Element, Fill, Font, Length, Task, Theme, padding};
+use iced::{Element, Event, Fill, Font, Length, Subscription, Task, Theme, highlighter, padding};
 
 use crate::connector::{
     self, ColumnInfo, Connector, QueryPlan, QueryResult, Result, TableRef, execution_order,
@@ -15,14 +19,25 @@ use crate::manager::{self, Feedback, Field, Manager};
 use crate::store::{self, ConnectionConfig, Engine, Location};
 use crate::theme;
 
-const CELL_WIDTH: f32 = 180.0;
 const MONO: Font = Font::MONOSPACE;
+/// Largeur approximative d'un caractère en police mono de 13 px.
+const CHAR_WIDTH: f32 = 7.8;
+const MIN_CELL: f32 = 70.0;
+const MAX_CELL: f32 = 420.0;
+const PAGE_SIZE: usize = 200;
+const SIDEBAR_RATIO: f32 = 0.2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Results,
     Plan,
     Schema,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Pane {
+    Sidebar,
+    Workspace,
 }
 
 #[derive(Debug, Clone)]
@@ -46,11 +61,20 @@ pub struct App {
     /// Connexion en cours d'ouverture (pour l'indicateur dans la barre latérale).
     connecting: Option<u64>,
     manager: Option<Manager>,
+    panes: pane_grid::State<Pane>,
+    /// Filtre de la liste des tables.
+    filter: String,
+    /// Schémas repliés dans la barre latérale.
+    collapsed: HashSet<String>,
     selected: Option<TableRef>,
     schema: Vec<ColumnInfo>,
     editor: text_editor::Content,
     result: Option<QueryResult>,
+    /// Requête qui a produit `result`, pour ne pas confondre avec l'éditeur.
+    result_sql: Option<String>,
+    page: usize,
     plan: Option<QueryPlan>,
+    plan_sql: Option<String>,
     tab: Tab,
     status: Status,
 }
@@ -63,7 +87,11 @@ pub enum Message {
     Disconnect,
     TablesLoaded(Result<Vec<TableRef>>),
     TableSelected(TableRef),
+    InsertTable(TableRef),
     SchemaLoaded(Result<Vec<ColumnInfo>>),
+    FilterChanged(String),
+    ToggleSchema(String),
+    PaneResized(pane_grid::ResizeEvent),
 
     // Gestionnaire de connexions
     OpenManager,
@@ -71,18 +99,22 @@ pub enum Message {
     EditConnection(Option<u64>),
     FormChanged(Field, String),
     FormEngine(Engine),
+    TogglePassword,
     TestConnection,
     TestDone(Result<String>),
     SaveConnection { connect: bool },
     DeleteConnection,
 
     // Espace de travail
-    Edit(text_editor::Action),
+    Edit(Action),
     Explain,
-    Explained(Result<QueryPlan>),
+    Explained(String, Result<QueryPlan>),
     Run,
-    QueryDone(Result<QueryResult>, Duration),
+    QueryDone(String, Result<QueryResult>, Duration),
     TabSelected(Tab),
+    PageChanged(usize),
+    CopyCell(String),
+    KeyPressed(Key, Modifiers),
 }
 
 /// Ouvre une connexion : mot de passe depuis le trousseau, puis connecteur.
@@ -106,16 +138,29 @@ impl App {
         // Premier lancement : on ouvre directement le gestionnaire.
         let manager = connections.is_empty().then(Manager::new);
 
+        let panes = pane_grid::State::with_configuration(pane_grid::Configuration::Split {
+            axis: pane_grid::Axis::Vertical,
+            ratio: SIDEBAR_RATIO,
+            a: Box::new(pane_grid::Configuration::Pane(Pane::Sidebar)),
+            b: Box::new(pane_grid::Configuration::Pane(Pane::Workspace)),
+        });
+
         Self {
             connections,
             session: None,
             connecting: None,
             manager,
+            panes,
+            filter: String::new(),
+            collapsed: HashSet::new(),
             selected: None,
             schema: Vec::new(),
             editor: text_editor::Content::with_text("SELECT 1 AS hello"),
             result: None,
+            result_sql: None,
+            page: 0,
             plan: None,
+            plan_sql: None,
             tab: Tab::Results,
             status,
         }
@@ -132,6 +177,18 @@ impl App {
         theme::quarry()
     }
 
+    pub fn subscription(&self) -> Subscription<Message> {
+        // Seuls les événements clavier ignorés par les widgets arrivent ici :
+        // l'éditeur gère lui-même ses raccourcis via `key_binding`.
+        iced::event::listen_with(|event, status, _| match (event, status) {
+            (
+                Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }),
+                iced::event::Status::Ignored,
+            ) => Some(Message::KeyPressed(key, modifiers)),
+            _ => None,
+        })
+    }
+
     fn active_config(&self) -> Option<&ConnectionConfig> {
         let id = self.session.as_ref()?.id;
         self.connections.iter().find(|c| c.id == id)
@@ -139,6 +196,14 @@ impl App {
 
     fn connector(&self) -> Option<Arc<dyn Connector>> {
         self.session.as_ref().map(|s| s.connector.clone())
+    }
+
+    /// SQL à exécuter : la sélection si elle existe, sinon tout l'éditeur.
+    fn current_sql(&self) -> String {
+        self.editor
+            .selection()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| self.editor.text())
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -157,6 +222,7 @@ impl App {
                 self.session = Some(Session { id, connector: c.clone(), tables: Vec::new() });
                 self.selected = None;
                 self.schema.clear();
+                self.collapsed.clear();
                 return Task::perform(async move { c.list_tables().await }, Message::TablesLoaded);
             }
             Message::Connected(_, Err(e)) => {
@@ -184,7 +250,27 @@ impl App {
                     Message::SchemaLoaded,
                 );
             }
+            Message::InsertTable(table) => {
+                let Some(c) = self.connector() else { return Task::none() };
+                let name = match &table.schema {
+                    Some(schema) => format!(
+                        "{}.{}",
+                        c.quote_identifier(schema),
+                        c.quote_identifier(&table.name)
+                    ),
+                    None => c.quote_identifier(&table.name),
+                };
+                self.editor.perform(Action::Edit(Edit::Paste(Arc::new(name))));
+                return Task::none();
+            }
             Message::SchemaLoaded(Ok(columns)) => self.schema = columns,
+            Message::FilterChanged(filter) => self.filter = filter,
+            Message::ToggleSchema(schema) => {
+                if !self.collapsed.remove(&schema) {
+                    self.collapsed.insert(schema);
+                }
+            }
+            Message::PaneResized(event) => self.panes.resize(event.split, event.ratio),
 
             Message::OpenManager => {
                 self.manager = Some(match self.active_config() {
@@ -205,6 +291,11 @@ impl App {
             Message::FormEngine(engine) => {
                 if let Some(m) = &mut self.manager {
                     m.form.set_engine(engine);
+                }
+            }
+            Message::TogglePassword => {
+                if let Some(m) = &mut self.manager {
+                    m.show_password = !m.show_password;
                 }
             }
             Message::TestConnection => {
@@ -256,44 +347,75 @@ impl App {
             Message::Explain => {
                 let Some(c) = self.connector() else { return Task::none() };
                 self.status = Status::Busy("Analyse du plan…".into());
-                let sql = self.editor.text();
-                return Task::perform(async move { c.explain(&sql).await }, Message::Explained);
+                let sql = self.current_sql();
+                return Task::perform(
+                    async move {
+                        let plan = c.explain(&sql).await;
+                        (sql, plan)
+                    },
+                    |(sql, plan)| Message::Explained(sql, plan),
+                );
             }
-            Message::Explained(Ok(plan)) => {
+            Message::Explained(sql, Ok(plan)) => {
                 self.status = Status::Idle;
                 self.plan = Some(plan);
+                self.plan_sql = Some(sql);
                 self.tab = Tab::Plan;
             }
             Message::Run => {
                 let Some(c) = self.connector() else { return Task::none() };
                 self.status = Status::Busy("Exécution…".into());
-                let sql = self.editor.text();
+                let sql = self.current_sql();
                 return Task::perform(
                     async move {
                         let start = Instant::now();
                         let result = c.query(&sql).await;
-                        (result, start.elapsed())
+                        (sql, result, start.elapsed())
                     },
-                    |(result, elapsed)| Message::QueryDone(result, elapsed),
+                    |(sql, result, elapsed)| Message::QueryDone(sql, result, elapsed),
                 );
             }
-            Message::QueryDone(Ok(result), elapsed) => {
+            Message::QueryDone(sql, Ok(result), elapsed) => {
+                let truncated = if result.rows.len() >= connector::MAX_ROWS {
+                    format!(" (affichage limité à {})", connector::MAX_ROWS)
+                } else {
+                    String::new()
+                };
                 self.status = Status::Info(format!(
-                    "{} ligne(s) en {} ms",
+                    "{} ligne(s) en {} ms{truncated}",
                     result.rows.len(),
                     elapsed.as_millis()
                 ));
                 self.result = Some(result);
+                self.result_sql = Some(sql);
+                self.page = 0;
                 self.tab = Tab::Results;
             }
             Message::TabSelected(tab) => self.tab = tab,
+            Message::PageChanged(page) => self.page = page,
+            Message::CopyCell(value) => {
+                let preview: String = value.chars().take(40).collect();
+                self.status = Status::Info(format!("Copié : {preview}"));
+                return iced::clipboard::write(value);
+            }
+            Message::KeyPressed(key, modifiers) => return self.handle_key(key, modifiers),
 
             Message::TablesLoaded(Err(e))
             | Message::SchemaLoaded(Err(e))
-            | Message::Explained(Err(e))
-            | Message::QueryDone(Err(e), _) => self.status = Status::Error(e),
+            | Message::Explained(_, Err(e))
+            | Message::QueryDone(_, Err(e), _) => self.status = Status::Error(e),
         }
         Task::none()
+    }
+
+    /// Raccourcis globaux (hors éditeur, qui a les siens).
+    fn handle_key(&mut self, key: Key, modifiers: Modifiers) -> Task<Message> {
+        match key.as_ref() {
+            Key::Named(Named::Escape) if self.manager.is_some() => self.update(Message::CloseManager),
+            Key::Named(Named::Enter) if modifiers.command() => self.update(Message::Run),
+            Key::Character("e") if modifiers.command() => self.update(Message::Explain),
+            _ => Task::none(),
+        }
     }
 
     fn save_connection(&mut self, connect: bool) -> Task<Message> {
@@ -334,9 +456,23 @@ impl App {
         Task::none()
     }
 
+    // ----------------------------------------------------------------------
+    // Vues
+    // ----------------------------------------------------------------------
+
     pub fn view(&self) -> Element<'_, Message> {
-        let body = row![self.sidebar(), self.workspace()].spacing(12).height(Fill);
-        let base = column![self.top_bar(), body].spacing(12).padding(12);
+        let panes = pane_grid(&self.panes, |_, pane, _| {
+            pane_grid::Content::new(match pane {
+                Pane::Sidebar => self.sidebar(),
+                Pane::Workspace => self.workspace(),
+            })
+        })
+        .on_resize(8, Message::PaneResized)
+        .style(theme::pane_grid)
+        .spacing(10)
+        .height(Fill);
+
+        let base = column![self.top_bar(), panes, self.status_bar()].spacing(10).padding(12);
 
         match &self.manager {
             Some(m) => stack![base, manager::view(m, &self.connections)].into(),
@@ -345,34 +481,45 @@ impl App {
     }
 
     fn top_bar(&self) -> Element<'_, Message> {
-        let (label, color) = match &self.status {
-            Status::Idle => (String::new(), theme::MUTED),
-            Status::Busy(msg) => (msg.clone(), theme::WARNING),
-            Status::Info(msg) => (msg.clone(), theme::SUCCESS),
-            Status::Error(msg) => (msg.clone(), theme::DANGER),
-        };
-
-        let active = match self.active_config() {
+        let active: Element<'_, Message> = match self.active_config() {
             Some(c) => row![
-                text(&c.name).size(14).color(theme::TEXT),
+                text("●").size(10).color(theme::SUCCESS),
+                text(&c.name).size(15).color(theme::TEXT),
                 text(c.summary()).size(12).font(MONO).color(theme::MUTED),
-                button(text("Déconnecter").size(12))
-                    .on_press(Message::Disconnect)
-                    .style(button::text),
             ]
             .spacing(10)
-            .align_y(iced::Center),
-            None => row![text("Aucune connexion").size(14).color(theme::MUTED)],
+            .align_y(iced::Center)
+            .into(),
+            None => text("Aucune connexion ouverte").size(14).color(theme::MUTED).into(),
         };
+
+        let disconnect = button(text("Déconnecter").size(13))
+            .on_press_maybe(self.session.as_ref().map(|_| Message::Disconnect))
+            .style(theme::outline(theme::DANGER))
+            .padding([5, 12]);
 
         row![
             text("Quarry").size(20).color(theme::PRIMARY),
             container(active).width(Fill),
-            container(text(label).size(13).color(color)).max_width(520),
+            disconnect,
         ]
         .spacing(16)
         .align_y(iced::Center)
         .into()
+    }
+
+    fn status_bar(&self) -> Element<'_, Message> {
+        let (label, color) = match &self.status {
+            Status::Idle => ("Prêt · ⌘↩ exécuter · ⌘E expliquer".to_string(), theme::MUTED),
+            Status::Busy(msg) => (msg.clone(), theme::WARNING),
+            Status::Info(msg) => (msg.clone(), theme::SUCCESS),
+            Status::Error(msg) => (msg.clone(), theme::DANGER),
+        };
+        container(text(label).size(12).font(MONO).color(color))
+            .style(theme::status_bar)
+            .padding([6, 10])
+            .width(Fill)
+            .into()
     }
 
     fn sidebar(&self) -> Element<'_, Message> {
@@ -403,15 +550,21 @@ impl App {
         ]
         .align_y(iced::Center);
 
-        container(column![header, scrollable(list).height(Fill)].spacing(4))
+        let filter = text_input("Filtrer les tables…", &self.filter)
+            .on_input(Message::FilterChanged)
+            .size(13)
+            .padding(6);
+
+        container(column![header, filter, scrollable(list).height(Fill)].spacing(6))
             .style(theme::panel)
             .padding(10)
-            .width(260)
+            .width(Fill)
             .height(Fill)
             .into()
     }
 
-    /// Une connexion ; si elle est ouverte, ses tables s'affichent dessous.
+    /// Une connexion ; si elle est ouverte, ses tables s'affichent dessous,
+    /// groupées par schéma.
     fn connection_entry<'a>(&'a self, config: &'a ConnectionConfig) -> Element<'a, Message> {
         let session = self.session.as_ref().filter(|s| s.id == config.id);
         let marker = if session.is_some() {
@@ -426,10 +579,11 @@ impl App {
             row![
                 marker.size(10),
                 column![
-                    text(&config.name).size(13),
+                    text(&config.name).size(13).wrapping(text::Wrapping::None),
                     text(format!("{} · {}", config.engine, config.summary()))
                         .size(11)
-                        .color(theme::MUTED),
+                        .color(theme::MUTED)
+                        .wrapping(text::Wrapping::None),
                 ],
             ]
             .spacing(8)
@@ -437,25 +591,89 @@ impl App {
         )
         .on_press(Message::Connect(config.id))
         .style(theme::list_item(session.is_some()))
-        .width(Fill);
+        .width(Fill)
+        .clip(true);
 
         let Some(session) = session else { return entry.into() };
 
-        let tables = session.tables.iter().map(|table| {
-            let active = self.selected.as_ref() == Some(table);
-            button(text(table.to_string()).size(12).font(MONO))
-                .on_press(Message::TableSelected(table.clone()))
-                .style(theme::list_item(active))
-                .width(Fill)
-                .into()
-        });
+        let filter = self.filter.trim().to_lowercase();
+        let mut by_schema: BTreeMap<String, Vec<&TableRef>> = BTreeMap::new();
+        for table in &session.tables {
+            if !filter.is_empty() && !table.to_string().to_lowercase().contains(&filter) {
+                continue;
+            }
+            by_schema.entry(table.schema.clone().unwrap_or_default()).or_default().push(table);
+        }
 
-        column![
-            entry,
-            container(Column::with_children(tables).spacing(1)).padding(padding::left(18)),
-        ]
-        .spacing(2)
-        .into()
+        let mut tree = Column::new().spacing(1);
+        for (schema, tables) in by_schema {
+            let collapsed = self.collapsed.contains(&schema) && filter.is_empty();
+            if !schema.is_empty() {
+                let arrow = if collapsed { "▸" } else { "▾" };
+                tree = tree.push(
+                    button(
+                        text(format!("{arrow} {schema}  ({})", tables.len()))
+                            .size(12)
+                            .color(theme::MUTED)
+                            .wrapping(text::Wrapping::None),
+                    )
+                    .on_press(Message::ToggleSchema(schema.clone()))
+                    .style(theme::list_item(false))
+                    .padding([3, 6])
+                    .width(Fill)
+                    .clip(true),
+                );
+            }
+            if collapsed {
+                continue;
+            }
+            for table in tables {
+                tree = tree.push(self.table_entry(table, !schema.is_empty()));
+            }
+        }
+
+        if session.tables.is_empty() {
+            tree = tree.push(text("Aucune table").size(12).color(theme::MUTED));
+        }
+
+        column![entry, container(tree).padding(padding::left(12))].spacing(2).into()
+    }
+
+    /// Une table : clic = schéma + requête d'aperçu, « + » = insérer le nom
+    /// au curseur de l'éditeur.
+    fn table_entry<'a>(&'a self, table: &'a TableRef, indent: bool) -> Element<'a, Message> {
+        let active = self.selected.as_ref() == Some(table);
+        let name = button(
+            text(&table.name).size(12).font(MONO).wrapping(text::Wrapping::None),
+        )
+        .on_press(Message::TableSelected(table.clone()))
+        .style(theme::list_item(active))
+        .padding([3, 6])
+        .width(Fill)
+        .clip(true);
+
+        let name = tooltip(name, text(table.to_string()).size(12).font(MONO), tooltip::Position::Right)
+            .style(theme::tooltip)
+            .padding(6)
+            .gap(8);
+
+        let insert = tooltip(
+            button(text("+").size(12))
+                .on_press(Message::InsertTable(table.clone()))
+                .style(theme::list_item(false))
+                .padding([3, 7]),
+            text("Insérer dans l'éditeur").size(12),
+            tooltip::Position::Right,
+        )
+        .style(theme::tooltip)
+        .padding(6)
+        .gap(8);
+
+        row![name, insert]
+            .spacing(2)
+            .align_y(iced::Center)
+            .padding(padding::left(if indent { 10.0 } else { 0.0 }))
+            .into()
     }
 
     fn workspace(&self) -> Element<'_, Message> {
@@ -463,20 +681,26 @@ impl App {
 
         let editor = text_editor(&self.editor)
             .on_action(Message::Edit)
+            .key_binding(editor_key_binding)
+            .highlight("sql", highlighter::Theme::Base16Ocean)
             .font(MONO)
-            .height(160)
+            .height(170)
             .padding(10);
 
         let actions = row![
-            button("Expliquer")
+            button(text("Expliquer").size(13))
                 .on_press_maybe(connected.then_some(Message::Explain))
                 .style(button::secondary)
                 .padding([6, 14]),
-            button("Exécuter")
+            button(text("Exécuter  ⌘↩").size(13))
                 .on_press_maybe(connected.then_some(Message::Run))
                 .padding([6, 14]),
+            text("La sélection seule est exécutée si elle existe.")
+                .size(12)
+                .color(theme::MUTED),
         ]
-        .spacing(8);
+        .spacing(10)
+        .align_y(iced::Center);
 
         let tab = |label, tab| {
             button(text(label).size(13))
@@ -513,13 +737,40 @@ impl App {
 
     fn results_view(&self) -> Element<'_, Message> {
         let Some(result) = &self.result else {
-            return hint("Écris une requête puis clique sur « Exécuter ».");
+            return hint("Écris une requête puis clique sur « Exécuter » (⌘↩).");
         };
         if result.columns.is_empty() {
             return hint("La requête n'a renvoyé aucune ligne.");
         }
-        let rows = result.rows.iter().map(|r| r.iter().map(|c| c.display()).collect());
-        grid(result.columns.clone(), rows)
+
+        let total = result.rows.len();
+        let pages = total.div_ceil(PAGE_SIZE).max(1);
+        let page = self.page.min(pages - 1);
+        let start = page * PAGE_SIZE;
+        let end = (start + PAGE_SIZE).min(total);
+
+        let rows = result.rows[start..end].iter().map(|r| r.iter().map(|c| c.display()).collect());
+        let grid = grid(result.columns.clone(), rows);
+
+        let mut header = row![source_line(self.result_sql.as_deref())].spacing(12).align_y(iced::Center);
+        if pages > 1 {
+            let nav = |label, target: Option<usize>| {
+                button(text(label).size(12))
+                    .on_press_maybe(target.map(Message::PageChanged))
+                    .style(button::secondary)
+                    .padding([2, 8])
+            };
+            header = header.push(container(row![
+                nav("‹", page.checked_sub(1)),
+                text(format!("lignes {}–{} sur {total}", start + 1, end)).size(12).color(theme::MUTED),
+                nav("›", (page + 1 < pages).then_some(page + 1)),
+            ]
+            .spacing(8)
+            .align_y(iced::Center))
+            .align_right(Fill));
+        }
+
+        column![header, grid].spacing(6).into()
     }
 
     fn schema_view(&self) -> Element<'_, Message> {
@@ -543,7 +794,7 @@ impl App {
 
     fn plan_view(&self) -> Element<'_, Message> {
         let Some(plan) = &self.plan else {
-            return hint("Clique sur « Expliquer » pour voir le plan sans exécuter la requête.");
+            return hint("Clique sur « Expliquer » (⌘E) pour voir le plan sans exécuter la requête.");
         };
 
         let total = match plan.total_cost {
@@ -560,9 +811,11 @@ impl App {
                 stats.push(format!("~{rows:.0} lignes"));
             }
             row![
-                text(format!("└ {}", node.label)).font(MONO).size(13).width(Fill),
+                text(format!("└ {}", node.label)).font(MONO).size(13),
                 text(stats.join(" · ")).size(12).color(theme::MUTED),
             ]
+            .spacing(14)
+            .align_y(iced::Center)
             .padding(padding::left(node.depth as f32 * 20.0))
             .into()
         });
@@ -571,7 +824,11 @@ impl App {
             text(format!("{}. {}", step + 1, plan.nodes[i].label)).font(MONO).size(13).into()
         });
 
-        let mut content = column![text(total).size(15).color(theme::PRIMARY)].spacing(10);
+        let mut content = column![
+            source_line(self.plan_sql.as_deref()),
+            text(total).size(15).color(theme::PRIMARY),
+        ]
+        .spacing(10);
         if let Some(note) = &plan.note {
             content = content.push(text(note).size(12).color(theme::MUTED));
         }
@@ -585,6 +842,31 @@ impl App {
     }
 }
 
+/// Raccourcis de l'éditeur : ⌘↩ exécute, ⌘E explique, le reste est standard.
+fn editor_key_binding(press: KeyPress) -> Option<Binding<Message>> {
+    if press.modifiers.command() {
+        match press.key.as_ref() {
+            Key::Named(Named::Enter) => return Some(Binding::Custom(Message::Run)),
+            Key::Character("e") => return Some(Binding::Custom(Message::Explain)),
+            _ => {}
+        }
+    }
+    Binding::from_key_press(press)
+}
+
+/// « Requête : SELECT … » au-dessus d'un résultat, pour savoir d'où il vient.
+fn source_line(sql: Option<&str>) -> Element<'_, Message> {
+    let sql = sql.unwrap_or_default().split_whitespace().collect::<Vec<_>>().join(" ");
+    let preview: String = sql.chars().take(120).collect();
+    let suffix = if sql.chars().count() > 120 { "…" } else { "" };
+    text(format!("Requête : {preview}{suffix}"))
+        .size(12)
+        .font(MONO)
+        .color(theme::MUTED)
+        .wrapping(text::Wrapping::None)
+        .into()
+}
+
 fn hint(message: &str) -> Element<'_, Message> {
     container(text(message).color(theme::MUTED)).center(Fill).into()
 }
@@ -593,25 +875,47 @@ fn section(title: &str) -> Element<'_, Message> {
     text(title).size(11).color(theme::MUTED).into()
 }
 
-/// Grille défilable dans les deux sens, avec en-tête et lignes alternées.
-fn grid<'a>(
-    columns: Vec<String>,
-    rows: impl Iterator<Item = Vec<String>>,
-) -> Element<'a, Message> {
-    let cell = |value: String| {
-        container(text(value).font(MONO).size(13).wrapping(text::Wrapping::None))
-            .width(CELL_WIDTH)
+/// Grille défilable dans les deux sens. Les colonnes prennent la largeur de
+/// leur contenu (bornée) et un clic sur une cellule copie sa valeur.
+fn grid<'a>(columns: Vec<String>, rows: impl Iterator<Item = Vec<String>>) -> Element<'a, Message> {
+    let rows: Vec<Vec<String>> = rows.collect();
+
+    let widths: Vec<f32> = columns
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let longest = rows
+                .iter()
+                .filter_map(|r| r.get(i))
+                .map(|v| v.chars().count())
+                .max()
+                .unwrap_or(0)
+                .max(name.chars().count());
+            (longest as f32 * CHAR_WIDTH + 18.0).clamp(MIN_CELL, MAX_CELL)
+        })
+        .collect();
+
+    let header = Row::with_children(columns.iter().zip(&widths).map(|(name, &w)| {
+        container(text(name.clone()).font(MONO).size(13).wrapping(text::Wrapping::None))
+            .width(w)
             .padding([4, 8])
             .clip(true)
-    };
-
-    let header = Row::with_children(columns.into_iter().map(|c| cell(c).into()));
+            .into()
+    }));
     let header = container(header).style(theme::header_cell);
 
-    let lines = rows.enumerate().map(|(i, values)| {
-        container(Row::with_children(values.into_iter().map(|v| cell(v).into())))
-            .style(theme::grid_row(i % 2 == 1))
-            .into()
+    let lines = rows.into_iter().enumerate().map(|(i, values)| {
+        let cells = values.into_iter().zip(&widths).map(|(value, &w)| {
+            let label = text(value.clone()).font(MONO).size(13).wrapping(text::Wrapping::None);
+            button(label)
+                .on_press(Message::CopyCell(value))
+                .style(theme::cell)
+                .width(w)
+                .padding([3, 8])
+                .clip(true)
+                .into()
+        });
+        container(Row::with_children(cells)).style(theme::grid_row(i % 2 == 1)).into()
     });
 
     let body = column![header, Column::with_children(lines)].width(Length::Shrink);

@@ -8,8 +8,10 @@ Client de bases de données léger et multiplateforme (macOS, Linux, Windows), �
 - **Gestionnaire de connexions** (bouton « Gérer ») : ajouter, tester, modifier, supprimer
 - Barre latérale groupée en **Local / Distant / Cloud** : un clic pour se (re)connecter
 - Mots de passe stockés dans le **trousseau du système** (Keychain, Gestionnaire d'identification Windows, Secret Service), jamais en clair sur le disque
-- Liste des tables et **schéma** de chaque table (types, NULL, valeurs par défaut, clé primaire)
-- Éditeur SQL et grille de résultats défilable (limitée à 5 000 lignes)
+- Tables groupées par schéma, filtre, barre latérale **redimensionnable**, bouton `+` pour **insérer le nom d'une table au curseur**
+- **Schéma** de chaque table (types, NULL, valeurs par défaut, clé primaire)
+- Éditeur SQL avec coloration, `⌘↩` exécute (la sélection seule si elle existe), `⌘E` explique
+- Grille de résultats paginée (200 lignes par page, 5 000 max), colonnes ajustées au contenu, **clic sur une cellule pour copier**
 - **Plan d'exécution avant exécution** (`EXPLAIN`, sans `ANALYZE`) : arbre du plan, ordre d'exécution des étapes et coût estimé quand le moteur le fournit
 
 | Moteur | Plan | Coût estimé |
@@ -71,5 +73,10 @@ Pour ajouter un moteur (MongoDB/DocumentDB…), il suffit d'implémenter le trai
 - [x] Connexions enregistrées (mots de passe dans le trousseau du système)
 - [ ] Classement local / distant (`store::ConnectionConfig::location`)
 - [ ] Connecteur MongoDB / DocumentDB
-- [ ] Grille virtualisée pour les gros résultats
-- [ ] Coloration syntaxique SQL et raccourci Ctrl/Cmd+Entrée
+- [ ] Diagramme des relations (MCD / MLD / MPD)
+- [ ] Connecteurs téléchargeables (processus séparés)
+- [ ] Tri et filtre des résultats
+- [ ] Édition des lignes : ajout, modification, suppression
+- [ ] Import de fichiers (CSV, Parquet, Excel) dans une table
+- [ ] Onglets et historique de requêtes
+- [ ] Thème clair

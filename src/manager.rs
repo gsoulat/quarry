@@ -1,8 +1,8 @@
 //! Fenêtre de gestion des connexions : liste à gauche, formulaire à droite.
 
 use iced::widget::{
-    Column, button, center, column, container, mouse_area, opaque, pick_list, row, scrollable,
-    text, text_input,
+    Column, button, center, column, container, opaque, pick_list, row, scrollable, text,
+    text_input,
 };
 use iced::{Background, Color, Element, Fill, Font};
 
@@ -138,15 +138,26 @@ pub struct Manager {
     pub editing: Option<u64>,
     pub form: Form,
     pub feedback: Option<Feedback>,
+    pub show_password: bool,
 }
 
 impl Manager {
     pub fn new() -> Self {
-        Self { editing: None, form: Form::new(Engine::Postgres), feedback: None }
+        Self {
+            editing: None,
+            form: Form::new(Engine::Postgres),
+            feedback: None,
+            show_password: false,
+        }
     }
 
     pub fn edit(config: &ConnectionConfig) -> Self {
-        Self { editing: Some(config.id), form: Form::from_config(config), feedback: None }
+        Self {
+            editing: Some(config.id),
+            form: Form::from_config(config),
+            feedback: None,
+            show_password: false,
+        }
     }
 }
 
@@ -179,17 +190,15 @@ pub fn view<'a>(manager: &'a Manager, connections: &'a [ConnectionConfig]) -> El
     let dialog = container(content)
         .style(theme::panel)
         .padding(20)
-        .width(820)
+        .width(860)
         .height(560);
 
-    // Fond assombri : un clic à côté ferme la fenêtre.
-    opaque(
-        mouse_area(center(opaque(dialog)).style(|_| container::Style {
-            background: Some(Background::Color(Color { a: 0.7, ..Color::BLACK })),
-            ..container::Style::default()
-        }))
-        .on_press(Message::CloseManager),
-    )
+    // Fond assombri. La fenêtre se ferme par Échap ou par le bouton,
+    // jamais par un clic à côté : on ne perd pas ce qu'on a saisi.
+    opaque(center(opaque(dialog)).style(|_| container::Style {
+        background: Some(Background::Color(Color { a: 0.7, ..Color::BLACK })),
+        ..container::Style::default()
+    }))
 }
 
 fn form_view(manager: &Manager) -> Element<'_, Message> {
@@ -199,7 +208,7 @@ fn form_view(manager: &Manager) -> Element<'_, Message> {
             text(label).size(12).color(theme::MUTED),
             text_input(placeholder, value)
                 .on_input(move |v| Message::FormChanged(field, v))
-                .secure(field == Field::Password)
+                .secure(field == Field::Password && !manager.show_password)
                 .padding(8),
         ]
         .spacing(4)
@@ -210,8 +219,16 @@ fn form_view(manager: &Manager) -> Element<'_, Message> {
         None => "Nouvelle connexion",
     };
 
+    let header = row![
+        text(title).size(18).color(theme::TEXT).width(Fill),
+        button(text("Fermer  ⎋").size(13))
+            .on_press(Message::CloseManager)
+            .style(button::text),
+    ]
+    .align_y(iced::Center);
+
     let mut fields = column![
-        text(title).size(18).color(theme::TEXT),
+        header,
         row![
             input("Nom", "Production, Docker local…", &form.name, Field::Name).width(Fill),
             column![
@@ -244,7 +261,16 @@ fn form_view(manager: &Manager) -> Element<'_, Message> {
                         input("Utilisateur", "postgres", &form.user, Field::User).width(Fill),
                         input("Mot de passe", password_hint, &form.password, Field::Password)
                             .width(Fill),
+                        column![
+                            text("").size(12),
+                            button(text(if manager.show_password { "Masquer" } else { "Voir" }).size(13))
+                                .on_press(Message::TogglePassword)
+                                .style(button::secondary)
+                                .padding([8, 10]),
+                        ]
+                        .spacing(4),
                     ]
+                    .align_y(iced::alignment::Vertical::Bottom)
                     .spacing(12),
                 )
                 .push(input("Base de données", "optionnel", &form.database, Field::Database))
@@ -295,7 +321,7 @@ fn form_view(manager: &Manager) -> Element<'_, Message> {
     column![
         fields,
         container(feedback.size(13).font(Font::MONOSPACE)).height(Fill),
-        row![actions, container(button("Fermer").on_press(Message::CloseManager).style(button::text)).align_right(Fill)],
+        actions,
     ]
     .spacing(16)
     .width(Fill)

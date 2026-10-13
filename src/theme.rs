@@ -1,6 +1,6 @@
 //! Thème sombre de Quarry et styles des panneaux.
 
-use iced::widget::{button, container};
+use iced::widget::{button, container, pane_grid as grid};
 use iced::{Background, Border, Color, Theme, color};
 
 pub const BACKGROUND: Color = color!(0x0e1116);
@@ -52,6 +52,63 @@ pub fn header_cell(_theme: &Theme) -> container::Style {
 pub fn grid_row(odd: bool) -> impl Fn(&Theme) -> container::Style {
     move |_theme| container::Style {
         background: odd.then_some(Background::Color(color!(0x131820))),
+        ..container::Style::default()
+    }
+}
+
+/// Poignée entre les panneaux : visible seulement au survol.
+pub fn pane_grid(_theme: &Theme) -> grid::Style {
+    let line = |color| grid::Line { color, width: 3.0 };
+    grid::Style {
+        hovered_region: grid::Highlight {
+            background: Background::Color(Color { a: 0.1, ..PRIMARY }),
+            border: Border::default(),
+        },
+        picked_split: line(PRIMARY),
+        hovered_split: line(Color { a: 0.6, ..PRIMARY }),
+    }
+}
+
+/// Barre d'état en bas de la fenêtre.
+pub fn status_bar(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(SURFACE)),
+        border: Border { color: BORDER, width: 1.0, radius: 6.0.into() },
+        ..container::Style::default()
+    }
+}
+
+/// Bouton à contour, pour une action secondaire mais qui doit se voir
+/// (« Déconnecter »). La couleur donne l'intention.
+pub fn outline(color: Color) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        button::Style {
+            background: hovered.then_some(Background::Color(Color { a: 0.15, ..color })),
+            text_color: color,
+            border: Border { color, width: 1.0, radius: 6.0.into() },
+            ..button::Style::default()
+        }
+    }
+}
+
+/// Cellule de grille cliquable (copie la valeur), sans décoration.
+pub fn cell(_theme: &Theme, status: button::Status) -> button::Style {
+    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+    button::Style {
+        background: hovered.then_some(Background::Color(Color { a: 0.12, ..PRIMARY })),
+        text_color: TEXT,
+        border: Border { radius: 3.0.into(), ..Border::default() },
+        ..button::Style::default()
+    }
+}
+
+/// Infobulle.
+pub fn tooltip(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(SURFACE_ALT)),
+        text_color: Some(TEXT),
+        border: Border { color: BORDER, width: 1.0, radius: 6.0.into() },
         ..container::Style::default()
     }
 }
