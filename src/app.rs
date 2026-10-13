@@ -52,6 +52,9 @@ pub struct QueryTab {
     page: usize,
     plan: Option<QueryPlan>,
     plan_sql: Option<String>,
+    /// Tri côté client : (colonne, croissant).
+    sort: Option<(usize, bool)>,
+    filter: String,
 }
 
 impl QueryTab {
@@ -65,6 +68,8 @@ impl QueryTab {
             page: 0,
             plan: None,
             plan_sql: None,
+            sort: None,
+            filter: String::new(),
         }
     }
 
@@ -125,6 +130,10 @@ pub struct App {
     data: Option<QueryResult>,
     data_table: Option<TableRef>,
     data_row: Option<usize>,
+    data_sort: Option<(usize, bool)>,
+    data_filter: String,
+    /// Cellule en cours d'édition dans l'onglet Données : (ligne, colonne, texte).
+    editing_cell: Option<(usize, usize, String)>,
     /// Colonne sélectionnée dans l'onglet Schéma.
     schema_row: Option<usize>,
     dialog: Option<Dialog>,
@@ -202,6 +211,14 @@ pub enum Message {
     TabSelected(Tab),
     PageChanged(usize),
     CopyCell(String),
+    ResultSort(usize),
+    ResultFilter(String),
+    DataSort(usize),
+    DataFilter(String),
+    CellEditStart(usize, usize),
+    CellEditChanged(String),
+    CellEditSubmit,
+    CellEditCancel,
     KeyPressed(Key, Modifiers),
 }
 
@@ -248,6 +265,9 @@ impl App {
             data: None,
             data_table: None,
             data_row: None,
+            data_sort: None,
+            data_filter: String::new(),
+            editing_cell: None,
             schema_row: None,
             dialog: None,
             dialog_error: None,
@@ -494,9 +514,11 @@ impl App {
                 self.data = Some(result);
                 self.data_table = Some(table);
                 self.data_row = None;
+                self.editing_cell = None;
             }
             Message::DataLoaded(_, Err(e)) => self.status = Status::Error(e),
             Message::DataRowSelected(i) => {
+                self.editing_cell = None;
                 self.data_row = if self.data_row == Some(i) { None } else { Some(i) };
             }
             Message::SchemaRowSelected(i) => {
@@ -806,6 +828,57 @@ impl App {
                 }
             }
             Message::PageChanged(page) => self.tab_mut().page = page,
+            Message::ResultSort(col) => {
+                let tab = self.tab_mut();
+                tab.sort = toggle_sort(tab.sort, col);
+                tab.page = 0;
+            }
+            Message::ResultFilter(f) => {
+                let tab = self.tab_mut();
+                tab.filter = f;
+                tab.page = 0;
+            }
+            Message::DataSort(col) => self.data_sort = toggle_sort(self.data_sort, col),
+            Message::DataFilter(f) => self.data_filter = f,
+            Message::CellEditStart(row, col) => {
+                let text = self
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.rows.get(row))
+                    .and_then(|r| r.get(col))
+                    .map(|c| match c {
+                        connector::Cell::Null => String::new(),
+                        other => other.display(),
+                    })
+                    .unwrap_or_default();
+                self.editing_cell = Some((row, col, text));
+            }
+            Message::CellEditChanged(text) => {
+                if let Some(cell) = &mut self.editing_cell {
+                    cell.2 = text;
+                }
+            }
+            Message::CellEditCancel => self.editing_cell = None,
+            Message::CellEditSubmit => {
+                let Some((row, col, text)) = self.editing_cell.take() else { return Task::none() };
+                let (Some(table), Some(data), Some(c)) = (self.selected.clone(), self.data.as_ref(), self.connector()) else {
+                    return Task::none();
+                };
+                let Some(original) = data.rows.get(row) else { return Task::none() };
+                // Même chemin que le formulaire : seule la colonne touchée change.
+                let mut form = RowForm::update(table, self.schema.clone(), original);
+                if let Some(field) = form.fields.get_mut(col) {
+                    field.text = text;
+                    field.null = false;
+                }
+                match form.to_sql(c.as_ref()) {
+                    Ok(pending) => {
+                        self.dialog = Some(Dialog::Confirm(pending));
+                        self.dialog_error = None;
+                    }
+                    Err(e) => self.status = Status::Error(e),
+                }
+            }
             Message::CopyCell(value) => {
                 let preview: String = value.chars().take(40).collect();
                 self.status = Status::Info(format!("Copié : {preview}"));
@@ -825,6 +898,7 @@ impl App {
     /// Raccourcis globaux (hors éditeur, qui a les siens).
     fn handle_key(&mut self, key: Key, modifiers: Modifiers) -> Task<Message> {
         match key.as_ref() {
+            Key::Named(Named::Escape) if self.editing_cell.is_some() => self.update(Message::CellEditCancel),
             Key::Named(Named::Escape) if self.design.pending_link.is_some() => {
                 self.update(Message::Design(DesignMessage::LinkCancel))
             }
@@ -1442,16 +1516,25 @@ impl App {
             return hint("La requête n'a renvoyé aucune ligne.");
         }
 
-        let total = result.rows.len();
+        let order = order_rows(&result.rows, tab.sort, &tab.filter);
+        let total = order.len();
         let pages = total.div_ceil(PAGE_SIZE).max(1);
         let page = tab.page.min(pages - 1);
         let start = page * PAGE_SIZE;
         let end = (start + PAGE_SIZE).min(total);
 
-        let rows = result.rows[start..end].iter().map(|r| r.iter().map(|c| c.display()).collect());
-        let grid = grid(result.columns.clone(), rows, None, CellAction::Copy);
+        let rows = order[start..end].iter().map(|&i| (i, result.rows[i].iter().map(|c| c.display()).collect()));
+        let grid = Grid::new(result.columns.clone(), rows)
+            .action(CellAction::Copy)
+            .sort(tab.sort, Message::ResultSort)
+            .build();
 
-        let mut header = row![source_line(tab.result_sql.as_deref())].spacing(12).align_y(iced::Center);
+        let filter = text_input("Filtrer…", &tab.filter)
+            .on_input(Message::ResultFilter)
+            .size(12)
+            .padding([3, 8])
+            .width(180);
+        let mut header = row![source_line(tab.result_sql.as_deref()), filter].spacing(12).align_y(iced::Center);
         if pages > 1 {
             let nav = |label, target: Option<usize>| {
                 button(text(label).size(12))
@@ -1461,7 +1544,7 @@ impl App {
             };
             header = header.push(container(row![
                 nav("‹", page.checked_sub(1)),
-                text(format!("lignes {}–{} sur {total}", start + 1, end)).size(12).color(theme::MUTED),
+                text(format!("lignes {}–{} sur {total}{}", start + 1, end, if total < result.rows.len() { " (filtrées)" } else { "" })).size(12).color(theme::MUTED),
                 nav("›", (page + 1 < pages).then_some(page + 1)),
             ]
             .spacing(8)
@@ -1648,7 +1731,10 @@ impl App {
         column![
             toolbar,
             text("Clique sur une colonne pour la sélectionner.").size(11).color(theme::MUTED),
-            grid(header, rows, self.schema_row, CellAction::SelectRow(Message::SchemaRowSelected)),
+            Grid::new(header, rows.enumerate())
+                .selected(self.schema_row)
+                .action(CellAction::SelectRow(Message::SchemaRowSelected))
+                .build(),
         ]
         .spacing(6)
         .into()
@@ -1677,16 +1763,31 @@ impl App {
         let note = if !has_pk {
             "Cette table n'a pas de clé primaire : on peut insérer, mais pas modifier ni supprimer une ligne sans risque."
         } else if data.rows.len() >= connector::MAX_ROWS {
-            "Affichage limité aux premières lignes. Clique sur une ligne pour la sélectionner."
+            "Affichage limité aux premières lignes. Clic : sélectionner · second clic sur une cellule : la modifier · en-tête : trier."
         } else {
-            "Clique sur une ligne pour la sélectionner, puis Modifier ou Supprimer."
+            "Clic : sélectionner · second clic sur une cellule de la ligne sélectionnée : la modifier · en-tête : trier."
         };
 
-        let rows = data.rows.iter().map(|r| r.iter().map(|c| c.display()).collect());
+        let order = order_rows(&data.rows, self.data_sort, &self.data_filter);
+        let rows = order.iter().map(|&i| (i, data.rows[i].iter().map(|c| c.display()).collect()));
+        let mut grid = Grid::new(data.columns.clone(), rows)
+            .selected(self.data_row)
+            .action(CellAction::SelectRow(Message::DataRowSelected))
+            .sort(self.data_sort, Message::DataSort);
+        if has_pk {
+            grid = grid.editable(self.editing_cell.as_ref().map(|(r, c, t)| (*r, *c, t.as_str())));
+        }
+
+        let filter = text_input("Filtrer…", &self.data_filter)
+            .on_input(Message::DataFilter)
+            .size(12)
+            .padding([3, 8])
+            .width(180);
+
         column![
             toolbar,
-            text(note).size(11).color(theme::MUTED),
-            grid(data.columns.clone(), rows, self.data_row, CellAction::SelectRow(Message::DataRowSelected)),
+            row![text(note).size(11).color(theme::MUTED).width(Fill), filter].spacing(8).align_y(iced::Center),
+            grid.build(),
         ]
         .spacing(6)
         .into()
@@ -1891,73 +1992,192 @@ fn section(title: &str) -> Element<'_, Message> {
     text(title).size(11).color(theme::MUTED).into()
 }
 
+/// Bascule le tri sur une colonne : croissant, puis décroissant, puis aucun.
+fn toggle_sort(current: Option<(usize, bool)>, col: usize) -> Option<(usize, bool)> {
+    match current {
+        Some((c, true)) if c == col => Some((col, false)),
+        Some((c, false)) if c == col => None,
+        _ => Some((col, true)),
+    }
+}
+
+/// Indices des lignes à afficher : filtrées (sous-chaîne, sans casse, sur
+/// toutes les colonnes) puis triées. Les nombres se comparent comme des
+/// nombres, NULL en dernier.
+fn order_rows(rows: &[Vec<connector::Cell>], sort: Option<(usize, bool)>, filter: &str) -> Vec<usize> {
+    use connector::Cell;
+    let needle = filter.trim().to_lowercase();
+    let mut order: Vec<usize> = (0..rows.len())
+        .filter(|&i| needle.is_empty() || rows[i].iter().any(|c| c.display().to_lowercase().contains(&needle)))
+        .collect();
+    let Some((col, ascending)) = sort else { return order };
+
+    let key = |i: usize| rows[i].get(col);
+    order.sort_by(|&a, &b| {
+        let ordering = match (key(a), key(b)) {
+            (Some(Cell::Null) | None, Some(Cell::Null) | None) => std::cmp::Ordering::Equal,
+            (Some(Cell::Null) | None, _) => std::cmp::Ordering::Greater,
+            (_, Some(Cell::Null) | None) => std::cmp::Ordering::Less,
+            (Some(x), Some(y)) => match (number(x), number(y)) {
+                (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+                _ => x.display().to_lowercase().cmp(&y.display().to_lowercase()),
+            },
+        };
+        // NULL reste en dernier quel que soit le sens.
+        let is_null = |i| matches!(key(i), Some(Cell::Null) | None);
+        if is_null(a) || is_null(b) || ascending { ordering } else { ordering.reverse() }
+    });
+    order
+}
+
+fn number(cell: &connector::Cell) -> Option<f64> {
+    match cell {
+        connector::Cell::Int(i) => Some(*i as f64),
+        connector::Cell::Float(f) => Some(*f),
+        connector::Cell::Text(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
 /// Grille défilable dans les deux sens. Les colonnes prennent la largeur de
-/// leur contenu (bornée) et un clic sur une cellule copie sa valeur.
-fn grid<'a>(
+/// leur contenu (bornée). Chaque ligne porte son indice d'origine, pour que
+/// la sélection survive au tri et au filtre.
+struct Grid<'a> {
     columns: Vec<String>,
-    rows: impl Iterator<Item = Vec<String>>,
+    rows: Vec<(usize, Vec<String>)>,
     selected: Option<usize>,
     action: CellAction,
-) -> Element<'a, Message> {
-    let rows: Vec<Vec<String>> = rows.collect();
+    sort: Option<(usize, bool)>,
+    on_sort: Option<fn(usize) -> Message>,
+    /// (ligne, colonne, texte) : cette cellule est un champ de saisie.
+    editing: Option<(usize, usize, &'a str)>,
+    /// Second clic sur une cellule de la ligne sélectionnée : édition en place.
+    editable: bool,
+}
 
-    let widths: Vec<f32> = columns
-        .iter()
-        .enumerate()
-        .map(|(i, name)| {
-            let longest = rows
-                .iter()
-                .filter_map(|r| r.get(i))
-                .map(|v| v.chars().count())
-                .max()
-                .unwrap_or(0)
-                .max(name.chars().count());
-            (longest as f32 * CHAR_WIDTH + 18.0).clamp(MIN_CELL, MAX_CELL)
-        })
-        .collect();
-
-    let header = Row::with_children(columns.iter().zip(&widths).map(|(name, &w)| {
-        container(text(name.clone()).font(MONO).size(13).wrapping(text::Wrapping::None))
-            .width(w)
-            .padding([4, 8])
-            .clip(true)
-            .into()
-    }));
-    let header = container(header).style(theme::header_cell);
-
-    let lines = rows.into_iter().enumerate().map(|(i, values)| {
-        let cells = values.into_iter().zip(&widths).map(|(value, &w)| {
-            let label = text(value.clone()).font(MONO).size(13).wrapping(text::Wrapping::None);
-            let message = match action {
-                CellAction::Copy => Message::CopyCell(value),
-                CellAction::SelectRow(f) => f(i),
-            };
-            button(label)
-                .on_press(message)
-                .style(theme::cell)
-                .width(w)
-                .padding([3, 8])
-                .clip(true)
-                .into()
-        });
-        let line = container(Row::with_children(cells));
-        if selected == Some(i) {
-            line.style(theme::grid_row_selected).into()
-        } else {
-            line.style(theme::grid_row(i % 2 == 1)).into()
+impl<'a> Grid<'a> {
+    fn new(columns: Vec<String>, rows: impl Iterator<Item = (usize, Vec<String>)>) -> Self {
+        Self {
+            columns,
+            rows: rows.collect(),
+            selected: None,
+            action: CellAction::Copy,
+            sort: None,
+            on_sort: None,
+            editing: None,
+            editable: false,
         }
-    });
+    }
 
-    let body = column![header, Column::with_children(lines)].width(Length::Shrink);
+    fn selected(mut self, selected: Option<usize>) -> Self {
+        self.selected = selected;
+        self
+    }
 
-    scrollable(body)
-        .direction(scrollable::Direction::Both {
-            vertical: scrollable::Scrollbar::new(),
-            horizontal: scrollable::Scrollbar::new(),
-        })
-        .width(Fill)
-        .height(Fill)
-        .into()
+    fn action(mut self, action: CellAction) -> Self {
+        self.action = action;
+        self
+    }
+
+    fn sort(mut self, sort: Option<(usize, bool)>, on_sort: fn(usize) -> Message) -> Self {
+        self.sort = sort;
+        self.on_sort = Some(on_sort);
+        self
+    }
+
+    fn editable(mut self, editing: Option<(usize, usize, &'a str)>) -> Self {
+        self.editable = true;
+        self.editing = editing;
+        self
+    }
+
+    fn build(self) -> Element<'a, Message> {
+        let widths: Vec<f32> = self
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let longest = self
+                    .rows
+                    .iter()
+                    .filter_map(|(_, r)| r.get(i))
+                    .map(|v| v.chars().count())
+                    .max()
+                    .unwrap_or(0)
+                    .max(name.chars().count() + 2);
+                (longest as f32 * CHAR_WIDTH + 18.0).clamp(MIN_CELL, MAX_CELL)
+            })
+            .collect();
+
+        let header = Row::with_children(self.columns.iter().enumerate().zip(&widths).map(|((i, name), &w)| {
+            let arrow = match self.sort {
+                Some((c, true)) if c == i => " ▲",
+                Some((c, false)) if c == i => " ▼",
+                _ => "",
+            };
+            let label = text(format!("{name}{arrow}")).font(MONO).size(13).wrapping(text::Wrapping::None);
+            match self.on_sort {
+                Some(on_sort) => button(label)
+                    .on_press(on_sort(i))
+                    .style(theme::cell)
+                    .width(w)
+                    .padding([4, 8])
+                    .clip(true)
+                    .into(),
+                None => container(label).width(w).padding([4, 8]).clip(true).into(),
+            }
+        }));
+        let header = container(header).style(theme::header_cell);
+
+        let lines = self.rows.into_iter().enumerate().map(|(n, (i, values))| {
+            let is_selected = self.selected == Some(i);
+            let cells = values.into_iter().enumerate().zip(&widths).map(|((col, value), &w)| {
+                if let Some((er, ec, text_value)) = self.editing
+                    && er == i
+                    && ec == col
+                {
+                    return text_input("", text_value)
+                        .on_input(Message::CellEditChanged)
+                        .on_submit(Message::CellEditSubmit)
+                        .font(MONO)
+                        .size(13)
+                        .padding([1, 6])
+                        .width(w)
+                        .into();
+                }
+                let label = text(value.clone()).font(MONO).size(13).wrapping(text::Wrapping::None);
+                let message = match self.action {
+                    CellAction::Copy => Message::CopyCell(value),
+                    CellAction::SelectRow(_) if self.editable && is_selected => Message::CellEditStart(i, col),
+                    CellAction::SelectRow(f) => f(i),
+                };
+                button(label)
+                    .on_press(message)
+                    .style(theme::cell)
+                    .width(w)
+                    .padding([3, 8])
+                    .clip(true)
+                    .into()
+            });
+            let line = container(Row::with_children(cells));
+            if is_selected {
+                line.style(theme::grid_row_selected).into()
+            } else {
+                line.style(theme::grid_row(n % 2 == 1)).into()
+            }
+        });
+
+        let body = column![header, Column::with_children(lines)].width(Length::Shrink);
+
+        scrollable(body)
+            .direction(scrollable::Direction::Both {
+                vertical: scrollable::Scrollbar::new(),
+                horizontal: scrollable::Scrollbar::new(),
+            })
+            .width(Fill)
+            .height(Fill)
+            .into()
+    }
 }
 
 #[cfg(test)]
@@ -1973,6 +2193,29 @@ mod tests {
         assert!(!is_ddl("SELECT * FROM t"));
         assert!(!is_ddl("INSERT INTO t VALUES (1)"));
         assert!(!is_ddl("-- CREATE dans un commentaire\nSELECT 1"));
+    }
+
+    #[test]
+    fn sort_toggles_asc_desc_none() {
+        assert_eq!(toggle_sort(None, 2), Some((2, true)));
+        assert_eq!(toggle_sort(Some((2, true)), 2), Some((2, false)));
+        assert_eq!(toggle_sort(Some((2, false)), 2), None);
+        assert_eq!(toggle_sort(Some((2, false)), 0), Some((0, true)));
+    }
+
+    #[test]
+    fn rows_are_filtered_then_sorted_numerically_with_nulls_last() {
+        use connector::Cell;
+        let rows = vec![
+            vec![Cell::Text("b".into()), Cell::Int(10)],
+            vec![Cell::Text("a".into()), Cell::Null],
+            vec![Cell::Text("c".into()), Cell::Int(9)],
+            vec![Cell::Text("ab".into()), Cell::Float(9.5)],
+        ];
+        assert_eq!(order_rows(&rows, None, ""), vec![0, 1, 2, 3]);
+        assert_eq!(order_rows(&rows, Some((1, true)), ""), vec![2, 3, 0, 1]);
+        assert_eq!(order_rows(&rows, Some((1, false)), ""), vec![0, 3, 2, 1]);
+        assert_eq!(order_rows(&rows, Some((0, true)), "A"), vec![1, 3]);
     }
 
     #[test]
