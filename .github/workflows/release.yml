@@ -1,60 +1,63 @@
-# Une Release à chaque merge sur main : le workflow lit la version de
-# Cargo.toml, crée le tag `v<version>` s'il n'existe pas encore, construit
-# Quarry pour macOS (Apple Silicon et Intel), Linux et Windows, et attache
-# les archives à la Release GitHub. Chaque pull request doit donc
-# incrémenter la version dans Cargo.toml ; sans changement de version, rien
-# n'est publié.
+# Semantic release à chaque push sur main. semantic-release lit les commits
+# depuis le dernier tag (Conventional Commits : `feat:` → version mineure,
+# `fix:`, `perf:`, `refactor:` → correctif, `BREAKING CHANGE` → majeure),
+# calcule la version, met à jour Cargo.toml, Cargo.lock et CHANGELOG.md,
+# commit, tague `v<version>` et crée la Release GitHub avec les notes.
+# Les jobs suivants compilent Quarry depuis ce tag pour macOS (Apple
+# Silicon et Intel), Linux et Windows et attachent les archives.
+# Un commit sans type releasable (`ci:`, `docs:`, `chore:`…) ne publie rien.
+# Le titre de la pull request devient le message du squash merge : c'est
+# lui qui doit porter le type.
 name: Release
 
 on:
   push:
     branches: [main]
-    tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  version:
-    name: Version et tag
+  release:
+    name: Version, tag et Release
     runs-on: ubuntu-latest
     outputs:
-      tag: ${{ steps.decide.outputs.tag }}
-      publish: ${{ steps.decide.outputs.publish }}
+      published: ${{ steps.semantic.outputs.new_release_published }}
+      version: ${{ steps.semantic.outputs.new_release_version }}
+      tag: ${{ steps.semantic.outputs.new_release_git_tag }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - id: decide
-        shell: bash
-        run: |
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-            echo "publish=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          version=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
-          tag="v${version}"
-          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
-            echo "Le tag ${tag} existe déjà : pas de nouvelle release."
-            echo "tag=${tag}" >> "$GITHUB_OUTPUT"
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-          else
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git tag "${tag}"
-            git push origin "${tag}"
-            echo "tag=${tag}" >> "$GITHUB_OUTPUT"
-            echo "publish=true" >> "$GITHUB_OUTPUT"
-          fi
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: semantic-release
+        id: semantic
+        uses: cycjimmy/semantic-release-action@v4
+        with:
+          semantic_version: 24
+          extra_plugins: |
+            @semantic-release/changelog
+            @semantic-release/exec
+            @semantic-release/git
+            conventional-changelog-conventionalcommits
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build:
     name: ${{ matrix.name }}
-    needs: version
-    if: needs.version.outputs.publish == 'true'
+    needs: release
+    if: needs.release.outputs.published == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -63,22 +66,26 @@ jobs:
           - name: macOS (Apple Silicon)
             os: macos-14
             target: aarch64-apple-darwin
-            archive: Quarry-${{ needs.version.outputs.tag }}-macos-apple-silicon.zip
+            archive: Quarry-${{ needs.release.outputs.tag }}-macos-apple-silicon.zip
           # Compilé en croisé depuis le runner Apple Silicon.
           - name: macOS (Intel)
             os: macos-14
             target: x86_64-apple-darwin
-            archive: Quarry-${{ needs.version.outputs.tag }}-macos-intel.zip
+            archive: Quarry-${{ needs.release.outputs.tag }}-macos-intel.zip
           - name: Linux (x86_64)
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            archive: Quarry-${{ needs.version.outputs.tag }}-linux-x86_64.tar.gz
+            archive: Quarry-${{ needs.release.outputs.tag }}-linux-x86_64.tar.gz
           - name: Windows (x86_64)
             os: windows-latest
             target: x86_64-pc-windows-msvc
-            archive: Quarry-${{ needs.version.outputs.tag }}-windows-x86_64.zip
+            archive: Quarry-${{ needs.release.outputs.tag }}-windows-x86_64.zip
     steps:
+      # Le tag pointe sur le commit de release (Cargo.toml déjà à jour) :
+      # c'est lui qu'on compile, pour que CARGO_PKG_VERSION soit la bonne.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -124,34 +131,36 @@ jobs:
           Copy-Item README.md dist/
           Compress-Archive -Path dist/* -DestinationPath "${{ matrix.archive }}"
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.archive }}
-          path: ${{ matrix.archive }}
+      - name: Attacher l'archive à la Release
+        shell: bash
+        run: gh release upload "${{ needs.release.outputs.tag }}" "${{ matrix.archive }}" --repo "$GITHUB_REPOSITORY" --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  release:
-    name: Publier la Release
-    needs: [version, build]
-    if: needs.version.outputs.publish == 'true'
+  notes:
+    name: Notes d'installation
+    needs: [release, build]
+    if: needs.release.outputs.published == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          merge-multiple: true
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.version.outputs.tag }}
-          files: artifacts/*
-          generate_release_notes: true
-          body: |
-            ## Installation
+      - name: Ajouter la section Installation et marquer la Release comme dernière
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body > body.md
+          cat >> body.md <<'EOF'
 
-            - **macOS** : dézippe, glisse `Quarry.app` dans Applications. L'application n'est pas notariée par Apple :
-              au premier lancement macOS refuse de l'ouvrir ; va dans Réglages Système → Confidentialité et sécurité,
-              puis clique « Ouvrir quand même » en bas de la page. En alternative, dans le Terminal :
-              `xattr -dr com.apple.quarantine /Applications/Quarry.app`.
-            - **Linux** : `tar xzf` puis lance `./quarry`.
-            - **Windows** : dézippe et lance `Quarry.exe`. SmartScreen peut demander confirmation (exécutable non signé).
+          ## Installation
 
-            Les connecteurs (PostgreSQL, MySQL, BigQuery…) se téléchargent depuis l'application : Gérer → Connecteurs.
+          - **macOS** : dézippe, glisse `Quarry.app` dans Applications. L'application n'est pas notariée par Apple :
+            au premier lancement macOS refuse de l'ouvrir ; va dans Réglages Système → Confidentialité et sécurité,
+            puis clique « Ouvrir quand même » en bas de la page. En alternative, dans le Terminal :
+            `xattr -dr com.apple.quarantine /Applications/Quarry.app`.
+          - **Linux** : `tar xzf` puis lance `./quarry`.
+          - **Windows** : dézippe et lance `Quarry.exe`. SmartScreen peut demander confirmation (exécutable non signé).
+
+          Les connecteurs (PostgreSQL, MySQL, BigQuery…) se téléchargent depuis l'application : Gérer → Connecteurs.
+          EOF
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file body.md --latest

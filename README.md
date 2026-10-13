@@ -106,3 +106,16 @@ Pour ajouter un moteur (DuckDB, MongoDB…), on écrit un connecteur dans [quarr
 - [x] Connecteurs téléchargeables (processus séparés)
 - [x] Édition des lignes et des tables par l'interface
 - [ ] Thème clair
+
+## Publier une version
+
+Les releases sont automatiques (semantic-release). Chaque changement passe par une pull request ; son titre devient le message du squash merge et doit suivre [Conventional Commits](https://www.conventionalcommits.org/fr/) :
+
+| Préfixe du titre | Effet au merge sur `main` |
+|---|---|
+| `feat: …` | version mineure (0.5.0), Release avec binaires |
+| `fix: …`, `perf: …`, `refactor: …` | correctif (0.4.2), Release avec binaires |
+| `ci: …`, `docs: …`, `chore: …`, `test: …` | rien n'est publié |
+| `BREAKING CHANGE:` dans le corps, ou `feat!: …` | version majeure |
+
+La CI met à jour `Cargo.toml`, `Cargo.lock` et `CHANGELOG.md`, pose le tag `v<version>` et attache les archives macOS, Linux et Windows à la Release. Ne pas modifier la version à la main.
