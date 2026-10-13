@@ -203,13 +203,22 @@ impl ColumnDraft {
 /// Création d'une table.
 #[derive(Debug, Clone)]
 pub struct TableForm {
+    /// Schémas existants dans la base (vide : le moteur n'en a pas).
+    pub schemas: Vec<String>,
     pub schema: String,
     pub name: String,
     pub columns: Vec<ColumnDraft>,
 }
 
 impl TableForm {
-    pub fn new(schema: Option<&str>, engine: Engine) -> Self {
+    pub fn new(schemas: Vec<String>, engine: Engine) -> Self {
+        // `public` d'abord si présent, sinon le premier schéma.
+        let schema = schemas
+            .iter()
+            .find(|s| *s == "public")
+            .or(schemas.first())
+            .cloned()
+            .unwrap_or_default();
         let id_type = match engine {
             Engine::Postgres => "SERIAL",
             Engine::MySql => "INT",
@@ -218,7 +227,7 @@ impl TableForm {
         };
         let id = ColumnDraft { name: "id".into(), data_type: id_type.into(), ..ColumnDraft::new() };
         let id = ColumnDraft { nullable: false, primary_key: true, ..id };
-        Self { schema: schema.unwrap_or_default().into(), name: String::new(), columns: vec![id, ColumnDraft::new()] }
+        Self { schemas, schema, name: String::new(), columns: vec![id, ColumnDraft::new()] }
     }
 
     pub fn to_sql(&self, c: &dyn Connector) -> Result<Pending, String> {
@@ -585,18 +594,24 @@ fn column_rows<'a>(columns: &'a [ColumnDraft], removable: bool, engine: Engine) 
 }
 
 fn table_form(f: &TableForm, engine: Engine) -> Element<'_, Message> {
+    let schema_field: Element<'_, Message> = if f.schemas.is_empty() {
+        column![].into()
+    } else {
+        column![
+            label("Schéma"),
+            pick_list(f.schemas.clone(), Some(f.schema.clone()), |v| Message::Dialog(DialogMessage::TableSchema(v)))
+                .font(MONO)
+                .text_size(13)
+                .padding(6)
+                .width(Fill),
+        ]
+        .spacing(4)
+        .width(200)
+        .into()
+    };
     column![
         row![
-            column![
-                label("Schéma (optionnel)"),
-                text_input("public", &f.schema)
-                    .on_input(|v| Message::Dialog(DialogMessage::TableSchema(v)))
-                    .font(MONO)
-                    .size(13)
-                    .padding(6),
-            ]
-            .spacing(4)
-            .width(200),
+            schema_field,
             column![
                 label("Nom de la table"),
                 text_input("clients", &f.name)

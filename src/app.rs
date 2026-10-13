@@ -20,7 +20,7 @@ use crate::design::{self, Design, DesignMessage};
 use crate::diagram::{self, Diagram};
 use crate::editing::{self, Dialog, DialogMessage, Refresh, RenameForm, RowForm, TableForm};
 use crate::manager::{self, Feedback, Field, Manager};
-use crate::store::{self, ConnectionConfig, Engine, Location};
+use crate::store::{self, ConnectionConfig, Engine, HistoryEntry, Location, SavedQuery};
 use crate::theme;
 
 const MONO: Font = Font::MONOSPACE;
@@ -38,6 +38,39 @@ pub enum Tab {
     Plan,
     Schema,
     Diagram,
+    History,
+}
+
+/// Un onglet de requête : son éditeur et ce qu'il a produit.
+pub struct QueryTab {
+    id: u64,
+    name: String,
+    editor: text_editor::Content,
+    result: Option<QueryResult>,
+    /// Requête qui a produit `result`, pour ne pas confondre avec l'éditeur.
+    result_sql: Option<String>,
+    page: usize,
+    plan: Option<QueryPlan>,
+    plan_sql: Option<String>,
+}
+
+impl QueryTab {
+    fn new(id: u64, name: String, sql: &str) -> Self {
+        Self {
+            id,
+            name,
+            editor: text_editor::Content::with_text(sql),
+            result: None,
+            result_sql: None,
+            page: 0,
+            plan: None,
+            plan_sql: None,
+        }
+    }
+
+    fn saved(&self) -> SavedQuery {
+        SavedQuery { name: self.name.clone(), sql: self.editor.text() }
+    }
 }
 
 /// Que fait un clic sur une cellule de la grille.
@@ -73,6 +106,10 @@ pub struct App {
     /// Connexion en cours d'ouverture (pour l'indicateur dans la barre latérale).
     connecting: Option<u64>,
     manager: Option<Manager>,
+    tabs: Vec<QueryTab>,
+    active: usize,
+    next_tab_id: u64,
+    history: Vec<HistoryEntry>,
     panes: pane_grid::State<Pane>,
     /// Filtre de la liste des tables.
     filter: String,
@@ -95,13 +132,6 @@ pub struct App {
     edit_menu: bool,
     selected: Option<TableRef>,
     schema: Vec<ColumnInfo>,
-    editor: text_editor::Content,
-    result: Option<QueryResult>,
-    /// Requête qui a produit `result`, pour ne pas confondre avec l'éditeur.
-    result_sql: Option<String>,
-    page: usize,
-    plan: Option<QueryPlan>,
-    plan_sql: Option<String>,
     tab: Tab,
     status: Status,
 }
@@ -158,9 +188,15 @@ pub enum Message {
     // Espace de travail
     Edit(Action),
     Explain,
-    Explained(String, Result<QueryPlan>),
+    Explained(u64, String, Result<QueryPlan>),
     Run,
-    QueryDone(String, Result<QueryResult>, Duration),
+    QueryDone(u64, String, Result<QueryResult>, Duration),
+    QueryTabNew,
+    QueryTabSelect(u64),
+    QueryTabClose(u64),
+    QueryTabRename(String),
+    /// Ouvre une requête de l'historique dans un nouvel onglet.
+    HistoryOpen(String),
     TabSelected(Tab),
     PageChanged(usize),
     CopyCell(String),
@@ -216,12 +252,10 @@ impl App {
             edit_menu: false,
             selected: None,
             schema: Vec::new(),
-            editor: text_editor::Content::with_text("SELECT 1 AS hello"),
-            result: None,
-            result_sql: None,
-            page: 0,
-            plan: None,
-            plan_sql: None,
+            tabs: vec![QueryTab::new(1, "Requête 1".into(), "SELECT 1 AS hello")],
+            active: 0,
+            next_tab_id: 2,
+            history: Vec::new(),
             tab: Tab::Results,
             status,
         }
@@ -259,12 +293,51 @@ impl App {
         self.session.as_ref().map(|s| s.connector.clone())
     }
 
+    fn tab(&self) -> &QueryTab {
+        &self.tabs[self.active.min(self.tabs.len() - 1)]
+    }
+
+    fn tab_mut(&mut self) -> &mut QueryTab {
+        let i = self.active.min(self.tabs.len() - 1);
+        &mut self.tabs[i]
+    }
+
     /// SQL à exécuter : la sélection si elle existe, sinon tout l'éditeur.
     fn current_sql(&self) -> String {
-        self.editor
-            .selection()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| self.editor.text())
+        let editor = &self.tab().editor;
+        editor.selection().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| editor.text())
+    }
+
+    /// Ouvre un onglet et l'active.
+    fn open_tab(&mut self, name: String, sql: &str) {
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        self.tabs.push(QueryTab::new(id, name, sql));
+        self.active = self.tabs.len() - 1;
+    }
+
+    /// Enregistre les onglets de la connexion ouverte.
+    fn persist_tabs(&mut self) {
+        let Some(session) = &self.session else { return };
+        let queries: Vec<SavedQuery> = self.tabs.iter().map(QueryTab::saved).collect();
+        if let Err(e) = store::save_queries(session.id, &queries) {
+            self.status = Status::Error(e);
+        }
+    }
+
+    /// Remplace les onglets par ceux enregistrés pour une connexion.
+    fn load_tabs(&mut self, connection: u64) {
+        let saved = store::load_queries(connection);
+        self.tabs.clear();
+        if saved.is_empty() {
+            self.open_tab("Requête 1".into(), "");
+        } else {
+            for q in saved {
+                self.open_tab(q.name, &q.sql);
+            }
+        }
+        self.active = 0;
+        self.history = store::load_history(connection);
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -280,7 +353,9 @@ impl App {
             Message::Connected(id, Ok(c)) => {
                 self.connecting = None;
                 self.status = Status::Info(format!("Connecté ({})", c.engine()));
+                self.persist_tabs();
                 self.session = Some(Session { id, connector: c.clone(), tables: Vec::new() });
+                self.load_tabs(id);
                 self.selected = None;
                 self.schema.clear();
                 self.collapsed.clear();
@@ -295,7 +370,9 @@ impl App {
                 self.status = Status::Error(e);
             }
             Message::Disconnect => {
+                self.persist_tabs();
                 self.session = None;
+                self.history.clear();
                 self.selected = None;
                 self.schema.clear();
                 self.diagram = None;
@@ -322,7 +399,17 @@ impl App {
                 let Some(c) = self.connector() else { return Task::none() };
                 let same = self.selected.as_ref() == Some(&table);
                 if !same {
-                    self.editor = text_editor::Content::with_text(&c.preview_sql(&table));
+                    // On ne détruit pas une requête en cours : l'aperçu remplace
+                    // l'onglet actif seulement s'il est vide ou déjà un aperçu.
+                    let current = self.tab().editor.text();
+                    let is_preview = current.trim().is_empty()
+                        || (current.starts_with("SELECT * FROM") && current.lines().count() == 1);
+                    let sql = c.preview_sql(&table);
+                    if is_preview {
+                        self.tab_mut().editor = text_editor::Content::with_text(&sql);
+                    } else {
+                        self.open_tab(table.name.clone(), &sql);
+                    }
                 }
                 self.selected = Some(table.clone());
                 self.schema_row = None;
@@ -348,7 +435,7 @@ impl App {
                     ),
                     None => c.quote_identifier(&table.name),
                 };
-                self.editor.perform(Action::Edit(Edit::Paste(Arc::new(name))));
+                self.tab_mut().editor.perform(Action::Edit(Edit::Paste(Arc::new(name))));
                 return Task::none();
             }
             Message::SchemaLoaded(Ok(columns)) => self.schema = columns,
@@ -585,39 +672,45 @@ impl App {
                 self.manager = Some(manager);
             }
 
-            Message::Edit(action) => self.editor.perform(action),
+            Message::Edit(action) => self.tab_mut().editor.perform(action),
             Message::Explain => {
                 let Some(c) = self.connector() else { return Task::none() };
+                self.persist_tabs();
                 self.status = Status::Busy("Analyse du plan…".into());
                 let sql = self.current_sql();
+                let id = self.tab().id;
                 return Task::perform(
                     async move {
                         let plan = c.explain(&sql).await;
                         (sql, plan)
                     },
-                    |(sql, plan)| Message::Explained(sql, plan),
+                    move |(sql, plan)| Message::Explained(id, sql, plan),
                 );
             }
-            Message::Explained(sql, Ok(plan)) => {
+            Message::Explained(id, sql, Ok(plan)) => {
                 self.status = Status::Idle;
-                self.plan = Some(plan);
-                self.plan_sql = Some(sql);
+                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+                    tab.plan = Some(plan);
+                    tab.plan_sql = Some(sql);
+                }
                 self.tab = Tab::Plan;
             }
             Message::Run => {
                 let Some(c) = self.connector() else { return Task::none() };
+                self.persist_tabs();
                 self.status = Status::Busy("Exécution…".into());
                 let sql = self.current_sql();
+                let id = self.tab().id;
                 return Task::perform(
                     async move {
                         let start = Instant::now();
                         let result = c.query(&sql).await;
                         (sql, result, start.elapsed())
                     },
-                    |(sql, result, elapsed)| Message::QueryDone(sql, result, elapsed),
+                    move |(sql, result, elapsed)| Message::QueryDone(id, sql, result, elapsed),
                 );
             }
-            Message::QueryDone(sql, Ok(result), elapsed) => {
+            Message::QueryDone(id, sql, Ok(result), elapsed) => {
                 let truncated = if result.rows.len() >= connector::MAX_ROWS {
                     format!(" (affichage limité à {})", connector::MAX_ROWS)
                 } else {
@@ -628,9 +721,52 @@ impl App {
                     result.rows.len(),
                     elapsed.as_millis()
                 ));
-                self.result = Some(result);
-                self.result_sql = Some(sql);
-                self.page = 0;
+                if let Some(conn) = self.session.as_ref().map(|s| s.id) {
+                    let entry = HistoryEntry {
+                        sql: sql.clone(),
+                        at: chrono::Local::now().format("%d/%m %H:%M:%S").to_string(),
+                        rows: result.rows.len(),
+                        ms: elapsed.as_millis(),
+                    };
+                    match store::push_history(conn, entry) {
+                        Ok(history) => self.history = history,
+                        Err(e) => self.status = Status::Error(e),
+                    }
+                }
+                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+                    tab.result = Some(result);
+                    tab.result_sql = Some(sql);
+                    tab.page = 0;
+                }
+                self.tab = Tab::Results;
+            }
+            Message::QueryTabNew => {
+                let n = self.next_tab_id;
+                self.open_tab(format!("Requête {n}"), "");
+                self.persist_tabs();
+            }
+            Message::QueryTabSelect(id) => {
+                if let Some(i) = self.tabs.iter().position(|t| t.id == id) {
+                    self.active = i;
+                }
+            }
+            Message::QueryTabClose(id) => {
+                if let Some(i) = self.tabs.iter().position(|t| t.id == id) {
+                    self.tabs.remove(i);
+                    if self.tabs.is_empty() {
+                        self.open_tab("Requête 1".into(), "");
+                    }
+                    self.active = self.active.min(self.tabs.len() - 1);
+                    self.persist_tabs();
+                }
+            }
+            Message::QueryTabRename(name) => {
+                self.tab_mut().name = name;
+                self.persist_tabs();
+            }
+            Message::HistoryOpen(sql) => {
+                let n = self.next_tab_id;
+                self.open_tab(format!("Requête {n}"), &sql);
                 self.tab = Tab::Results;
             }
             Message::TabSelected(tab) => {
@@ -642,7 +778,7 @@ impl App {
                     return self.update(Message::LoadData);
                 }
             }
-            Message::PageChanged(page) => self.page = page,
+            Message::PageChanged(page) => self.tab_mut().page = page,
             Message::CopyCell(value) => {
                 let preview: String = value.chars().take(40).collect();
                 self.status = Status::Info(format!("Copié : {preview}"));
@@ -652,8 +788,8 @@ impl App {
 
             Message::TablesLoaded(Err(e))
             | Message::SchemaLoaded(Err(e))
-            | Message::Explained(_, Err(e))
-            | Message::QueryDone(_, Err(e), _) => self.status = Status::Error(e),
+            | Message::Explained(_, _, Err(e))
+            | Message::QueryDone(_, _, Err(e), _) => self.status = Status::Error(e),
         }
         Task::none()
     }
@@ -1132,10 +1268,49 @@ impl App {
             .into()
     }
 
+    fn query_tab_bar(&self) -> Element<'_, Message> {
+        let mut bar = Row::new().spacing(2).align_y(iced::Center);
+        for (i, tab) in self.tabs.iter().enumerate() {
+            let active = i == self.active;
+            let label: Element<'_, Message> = if active {
+                text_input("nom", &tab.name)
+                    .on_input(Message::QueryTabRename)
+                    .size(12)
+                    .padding([2, 6])
+                    .width(150)
+                    .into()
+            } else {
+                button(text(&tab.name).size(12).wrapping(text::Wrapping::None))
+                    .on_press(Message::QueryTabSelect(tab.id))
+                    .style(theme::list_item(false))
+                    .padding([4, 8])
+                    .into()
+            };
+            let close = button(text("×").size(12))
+                .on_press(Message::QueryTabClose(tab.id))
+                .style(button::text)
+                .padding([2, 4]);
+            bar = bar.push(
+                container(row![label, close].spacing(2).align_y(iced::Center))
+                    .style(if active { theme::header_cell } else { |_: &Theme| container::Style::default() })
+                    .padding(2),
+            );
+        }
+        bar = bar.push(
+            button(text("+").size(13))
+                .on_press(Message::QueryTabNew)
+                .style(theme::list_item(false))
+                .padding([3, 8]),
+        );
+        scrollable(bar)
+            .direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::new().width(4).scroller_width(4)))
+            .into()
+    }
+
     fn workspace(&self) -> Element<'_, Message> {
         let connected = self.session.is_some();
 
-        let editor = text_editor(&self.editor)
+        let editor = text_editor(&self.tab().editor)
             .on_action(Message::Edit)
             .key_binding(editor_key_binding)
             .highlight("sql", highlighter::Theme::Base16Ocean)
@@ -1170,6 +1345,7 @@ impl App {
             tab("Schéma", Tab::Schema),
             tab("Plan d'exécution", Tab::Plan),
             tab("Diagramme", Tab::Diagram),
+            tab("Historique", Tab::History),
         ]
         .spacing(4);
 
@@ -1179,9 +1355,11 @@ impl App {
             Tab::Plan => self.plan_view(),
             Tab::Schema => self.schema_view(),
             Tab::Diagram => self.diagram_view(),
+            Tab::History => self.history_view(),
         };
 
         column![
+            self.query_tab_bar(),
             editor,
             actions,
             container(column![tabs, content].spacing(8))
@@ -1195,8 +1373,41 @@ impl App {
         .into()
     }
 
+    fn history_view(&self) -> Element<'_, Message> {
+        if self.session.is_none() {
+            return hint("L'historique est propre à chaque connexion.");
+        }
+        if self.history.is_empty() {
+            return hint("Aucune requête exécutée sur cette connexion pour l'instant.");
+        }
+        let entries = self.history.iter().map(|h| {
+            let preview: String = h.sql.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(140).collect();
+            button(
+                row![
+                    text(&h.at).size(11).color(theme::MUTED).width(90),
+                    text(preview).size(12).font(MONO).wrapping(text::Wrapping::None).width(Fill),
+                    text(format!("{} l. · {} ms", h.rows, h.ms)).size(11).color(theme::MUTED),
+                ]
+                .spacing(10)
+                .align_y(iced::Center),
+            )
+            .on_press(Message::HistoryOpen(h.sql.clone()))
+            .style(theme::list_item(false))
+            .width(Fill)
+            .clip(true)
+            .into()
+        });
+        column![
+            text("Clique sur une requête pour l'ouvrir dans un nouvel onglet.").size(11).color(theme::MUTED),
+            scrollable(Column::with_children(entries).spacing(2)).height(Fill),
+        ]
+        .spacing(6)
+        .into()
+    }
+
     fn results_view(&self) -> Element<'_, Message> {
-        let Some(result) = &self.result else {
+        let tab = self.tab();
+        let Some(result) = &tab.result else {
             return hint("Écris une requête puis clique sur « Exécuter » (⌘↩).");
         };
         if result.columns.is_empty() {
@@ -1205,14 +1416,14 @@ impl App {
 
         let total = result.rows.len();
         let pages = total.div_ceil(PAGE_SIZE).max(1);
-        let page = self.page.min(pages - 1);
+        let page = tab.page.min(pages - 1);
         let start = page * PAGE_SIZE;
         let end = (start + PAGE_SIZE).min(total);
 
         let rows = result.rows[start..end].iter().map(|r| r.iter().map(|c| c.display()).collect());
         let grid = grid(result.columns.clone(), rows, None, CellAction::Copy);
 
-        let mut header = row![source_line(self.result_sql.as_deref())].spacing(12).align_y(iced::Center);
+        let mut header = row![source_line(tab.result_sql.as_deref())].spacing(12).align_y(iced::Center);
         if pages > 1 {
             let nav = |label, target: Option<usize>| {
                 button(text(label).size(12))
@@ -1241,8 +1452,10 @@ impl App {
     fn dialog_new_table(&self) -> Option<Dialog> {
         let session = self.session.as_ref()?;
         let config = self.active_config()?;
-        let schema = session.tables.iter().find_map(|t| t.schema.as_deref());
-        Some(Dialog::Table(TableForm::new(schema, config.engine)))
+        let mut schemas: Vec<String> = session.tables.iter().filter_map(|t| t.schema.clone()).collect();
+        schemas.sort_unstable();
+        schemas.dedup();
+        Some(Dialog::Table(TableForm::new(schemas, config.engine)))
     }
 
     fn dialog_rename_table(&self) -> Option<Dialog> {
@@ -1543,7 +1756,8 @@ impl App {
     }
 
     fn plan_view(&self) -> Element<'_, Message> {
-        let Some(plan) = &self.plan else {
+        let tab = self.tab();
+        let Some(plan) = &tab.plan else {
             return hint("Clique sur « Expliquer » (⌘E) pour voir le plan sans exécuter la requête.");
         };
 
@@ -1575,7 +1789,7 @@ impl App {
         });
 
         let mut content = column![
-            source_line(self.plan_sql.as_deref()),
+            source_line(tab.plan_sql.as_deref()),
             text(total).size(15).color(theme::PRIMARY),
         ]
         .spacing(10);

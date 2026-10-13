@@ -166,3 +166,65 @@ pub fn delete_password(id: u64) -> Result<(), String> {
         Err(e) => Err(format!("Trousseau : {e}")),
     }
 }
+
+// ----------------------------------------------------------------------
+// Requêtes enregistrées et historique, par connexion
+// ----------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedQuery {
+    pub name: String,
+    pub sql: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    pub sql: String,
+    /// Horodatage lisible (heure locale).
+    pub at: String,
+    pub rows: usize,
+    pub ms: u128,
+}
+
+const HISTORY_MAX: usize = 200;
+
+fn per_connection_file(kind: &str, id: u64) -> Option<PathBuf> {
+    let dirs = directories::ProjectDirs::from("fr", "gsoulat", "Quarry")?;
+    Some(dirs.config_dir().join(kind).join(format!("{id}.json")))
+}
+
+fn read_json<T: serde::de::DeserializeOwned + Default>(path: Option<PathBuf>) -> T {
+    path.and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
+}
+
+fn write_json<T: Serialize>(path: Option<PathBuf>, value: &T) -> Result<(), String> {
+    let path = path.ok_or("Dossier de configuration introuvable")?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+pub fn load_queries(connection: u64) -> Vec<SavedQuery> {
+    read_json(per_connection_file("queries", connection))
+}
+
+pub fn save_queries(connection: u64, queries: &[SavedQuery]) -> Result<(), String> {
+    write_json(per_connection_file("queries", connection), &queries)
+}
+
+pub fn load_history(connection: u64) -> Vec<HistoryEntry> {
+    read_json(per_connection_file("history", connection))
+}
+
+/// Ajoute une entrée en tête et borne la taille de l'historique.
+pub fn push_history(connection: u64, entry: HistoryEntry) -> Result<Vec<HistoryEntry>, String> {
+    let mut history = load_history(connection);
+    history.insert(0, entry);
+    history.truncate(HISTORY_MAX);
+    write_json(per_connection_file("history", connection), &history)?;
+    Ok(history)
+}
