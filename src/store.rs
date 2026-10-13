@@ -153,27 +153,84 @@ pub fn save(connections: &[ConnectionConfig]) -> Result<(), String> {
     std::fs::write(&path, json).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-fn keyring_entry(id: u64) -> Result<keyring::Entry, String> {
+/// Tous les mots de passe tiennent dans **un seul** élément du trousseau
+/// (un JSON `{ "<id>": "mot de passe" }`). Sur macOS, chaque élément
+/// déclenche sa propre demande d'autorisation : un seul élément, lu une
+/// fois par session, évite de retaper le mot de passe du trousseau pour
+/// chaque base.
+const KEYRING_ACCOUNT: &str = "connections";
+
+type Vault = std::collections::HashMap<u64, String>;
+
+fn vault_cache() -> &'static std::sync::Mutex<Option<Vault>> {
+    static CACHE: std::sync::Mutex<Option<Vault>> = std::sync::Mutex::new(None);
+    &CACHE
+}
+
+fn vault_entry() -> Result<keyring::Entry, String> {
+    keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT).map_err(|e| e.to_string())
+}
+
+/// Ancien schéma (un élément par connexion), conservé pour la migration.
+fn legacy_entry(id: u64) -> Result<keyring::Entry, String> {
     keyring::Entry::new(KEYRING_SERVICE, &format!("connection-{id}")).map_err(|e| e.to_string())
 }
 
+/// Lit le coffre (une seule fois par session, puis depuis la mémoire).
+fn vault() -> Result<Vault, String> {
+    let mut cache = vault_cache().lock().map_err(|_| "Cache du trousseau verrouillé")?;
+    if let Some(v) = cache.as_ref() {
+        return Ok(v.clone());
+    }
+    let vault: Vault = match vault_entry()?.get_password() {
+        Ok(json) => serde_json::from_str(&json).map_err(|e| format!("Trousseau illisible : {e}"))?,
+        Err(keyring::Error::NoEntry) => Vault::new(),
+        Err(e) => return Err(format!("Trousseau : {e}")),
+    };
+    *cache = Some(vault.clone());
+    Ok(vault)
+}
+
+fn write_vault(vault: Vault) -> Result<(), String> {
+    let json = serde_json::to_string(&vault).map_err(|e| e.to_string())?;
+    vault_entry()?.set_password(&json).map_err(|e| format!("Trousseau : {e}"))?;
+    if let Ok(mut cache) = vault_cache().lock() {
+        *cache = Some(vault);
+    }
+    Ok(())
+}
+
 pub fn password(id: u64) -> Result<Option<String>, String> {
-    match keyring_entry(id)?.get_password() {
-        Ok(password) => Ok(Some(password)),
+    let mut vault = vault()?;
+    if let Some(p) = vault.get(&id) {
+        return Ok(Some(p.clone()));
+    }
+    // Migration depuis l'ancien élément par connexion, s'il existe.
+    match legacy_entry(id)?.get_password() {
+        Ok(p) => {
+            vault.insert(id, p.clone());
+            write_vault(vault)?;
+            let _ = legacy_entry(id)?.delete_credential();
+            Ok(Some(p))
+        }
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(e) => Err(format!("Trousseau : {e}")),
     }
 }
 
 pub fn set_password(id: u64, password: &str) -> Result<(), String> {
-    keyring_entry(id)?.set_password(password).map_err(|e| format!("Trousseau : {e}"))
+    let mut vault = vault()?;
+    vault.insert(id, password.to_owned());
+    write_vault(vault)
 }
 
 pub fn delete_password(id: u64) -> Result<(), String> {
-    match keyring_entry(id)?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(format!("Trousseau : {e}")),
+    let mut vault = vault()?;
+    if vault.remove(&id).is_some() {
+        write_vault(vault)?;
     }
+    let _ = legacy_entry(id).and_then(|e| e.delete_credential().map_err(|e| e.to_string()));
+    Ok(())
 }
 
 // ----------------------------------------------------------------------

@@ -19,6 +19,7 @@ use crate::connector::{
 use crate::design::{self, Design, DesignMessage};
 use crate::diagram::{self, Diagram};
 use crate::editing::{self, Dialog, DialogMessage, Refresh, RenameForm, RowForm, TableForm};
+use crate::export::{self, Format};
 use crate::manager::{self, Feedback, Field, Manager};
 use crate::store::{self, ConnectionConfig, Engine, HistoryEntry, Location, SavedQuery};
 use crate::theme;
@@ -77,6 +78,12 @@ impl QueryTab {
     fn saved(&self) -> SavedQuery {
         SavedQuery { name: self.name.clone(), sql: self.editor.text() }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportSource {
+    Results,
+    Data,
 }
 
 /// Que fait un clic sur une cellule de la grille.
@@ -235,6 +242,9 @@ pub enum Message {
     CellEditChanged(String),
     CellEditSubmit,
     CellEditCancel,
+    /// Exporte les lignes affichées (filtrées, triées) de la source.
+    Export(ExportSource, Format),
+    Exported(Result<Option<std::path::PathBuf>>),
     KeyPressed(Key, Modifiers),
 }
 
@@ -897,6 +907,37 @@ impl App {
                 }
             }
             Message::CellEditCancel => self.editing_cell = None,
+            Message::Export(source, format) => {
+                let Some(c) = self.connector() else { return Task::none() };
+                let (columns, rows, order, table, name) = match source {
+                    ExportSource::Results => {
+                        let tab = self.tab();
+                        let Some(r) = &tab.result else { return Task::none() };
+                        let order = order_rows(&r.rows, tab.sort, &tab.filter);
+                        (&r.columns, &r.rows, order, None, tab.name.clone())
+                    }
+                    ExportSource::Data => {
+                        let Some(d) = &self.data else { return Task::none() };
+                        let order = order_rows(&d.rows, self.data_sort, &self.data_filter);
+                        let name = self.selected.as_ref().map_or("export".into(), |t| t.name.clone());
+                        (&d.columns, &d.rows, order, self.selected.as_ref(), name)
+                    }
+                };
+                let refs: Vec<&Vec<connector::Cell>> = order.iter().map(|&i| &rows[i]).collect();
+                match export::render(format, columns, &refs, table, c.as_ref()) {
+                    Ok(bytes) => {
+                        let suggested = name.replace(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '-', "_");
+                        self.status = Status::Busy(format!("Export de {} ligne(s)…", refs.len()));
+                        return Task::perform(export::save_with_dialog(suggested, format, bytes), Message::Exported);
+                    }
+                    Err(e) => self.status = Status::Error(e),
+                }
+            }
+            Message::Exported(Ok(Some(path))) => {
+                self.status = Status::Info(format!("Exporté : {}", path.display()));
+            }
+            Message::Exported(Ok(None)) => self.status = Status::Idle,
+            Message::Exported(Err(e)) => self.status = Status::Error(e),
             Message::CellEditSubmit => {
                 let Some((row, col, text)) = self.editing_cell.take() else { return Task::none() };
                 let (Some(table), Some(data), Some(c)) = (self.selected.clone(), self.data.as_ref(), self.connector()) else {
@@ -1622,7 +1663,9 @@ impl App {
             .size(12)
             .padding([3, 8])
             .width(180);
-        let mut header = row![source_line(tab.result_sql.as_deref()), filter].spacing(12).align_y(iced::Center);
+        let mut header = row![source_line(tab.result_sql.as_deref()), filter, export_buttons(ExportSource::Results)]
+            .spacing(12)
+            .align_y(iced::Center);
         if pages > 1 {
             let nav = |label, target: Option<usize>| {
                 button(text(label).size(12))
@@ -1886,7 +1929,9 @@ impl App {
 
         column![
             toolbar,
-            row![text(note).size(11).color(theme::MUTED).width(Fill), filter].spacing(8).align_y(iced::Center),
+            row![text(note).size(11).color(theme::MUTED).width(Fill), filter, export_buttons(ExportSource::Data)]
+                .spacing(8)
+                .align_y(iced::Center),
             grid.build(),
         ]
         .spacing(6)
@@ -2091,6 +2136,20 @@ fn hint(message: &str) -> Element<'_, Message> {
 
 fn section(title: &str) -> Element<'_, Message> {
     text(title).size(11).color(theme::MUTED).into()
+}
+
+/// « Exporter : CSV · JSON · SQL · Excel ».
+fn export_buttons<'a>(source: ExportSource) -> Element<'a, Message> {
+    let mut r = row![text("Exporter :").size(11).color(theme::MUTED)].spacing(4).align_y(iced::Center);
+    for format in Format::ALL {
+        r = r.push(
+            button(text(format.label()).size(11))
+                .on_press(Message::Export(source, format))
+                .style(theme::list_item(false))
+                .padding([2, 6]),
+        );
+    }
+    r.into()
 }
 
 /// Bascule le tri sur une colonne : croissant, puis décroissant, puis aucun.

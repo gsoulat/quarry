@@ -3,6 +3,7 @@ mod connector;
 mod design;
 mod diagram;
 mod editing;
+mod export;
 mod icon;
 mod manager;
 mod store;
