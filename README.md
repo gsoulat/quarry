@@ -53,7 +53,7 @@ Pour produire une vraie application (`Quarry.app`, `.msi`, `.deb`) avec son icô
 cargo install cargo-bundle && cargo bundle --release
 ```
 
-L'icône est générée par `cargo run --release --example gen_icon -- assets/icon.png 1024`.
+L'icône a pour source `assets/icon.svg` ; `scripts/make_icon.sh` (macOS) régénère `icon.png`, `icon-256.png` et `icon.icns`.
 
 ## Tests
 

@@ -1,4 +1,4 @@
-//! Icône de l'application, générée par `examples/gen_icon.rs`.
+//! Icône de l'application : source `assets/icon.svg`, rendus par `scripts/make_icon.sh`.
 
 use iced::window;
 
